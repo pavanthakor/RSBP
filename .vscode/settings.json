@@ -1,0 +1,11 @@
+{
+  "files.autoSave": "afterDelay",
+  "files.autoSaveDelay": 500,
+  "files.hotExit": "off",
+  "terminal.integrated.cwd": "${workspaceFolder}",
+  "go.useLanguageServer": true,
+  "go.toolsEnvVars": {
+    "GOWORK": "off",
+    "RSBP_ENV": "dev"
+  }
+}

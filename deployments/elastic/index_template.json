@@ -1,0 +1,187 @@
+{
+  "index_patterns": [
+    "rsbp-alerts-*"
+  ],
+  "priority": 250,
+  "version": 1,
+  "template": {
+    "settings": {
+      "index": {
+        "number_of_shards": 1,
+        "number_of_replicas": 1,
+        "refresh_interval": "10s"
+      }
+    },
+    "mappings": {
+      "dynamic": false,
+      "properties": {
+        "@timestamp": {
+          "type": "date"
+        },
+        "id": {
+          "type": "keyword"
+        },
+        "timestamp": {
+          "type": "date"
+        },
+        "severity": {
+          "type": "keyword"
+        },
+        "score": {
+          "type": "float"
+        },
+        "shell_category": {
+          "type": "integer"
+        },
+        "category_description": {
+          "type": "keyword"
+        },
+        "pattern": {
+          "type": "keyword"
+        },
+        "forensic_bundle_path": {
+          "type": "keyword"
+        },
+        "suppressed": {
+          "type": "boolean"
+        },
+        "suppress_reason": {
+          "type": "keyword"
+        },
+        "process": {
+          "properties": {
+            "pid": {
+              "type": "integer"
+            },
+            "ppid": {
+              "type": "integer"
+            },
+            "uid": {
+              "type": "integer"
+            },
+            "gid": {
+              "type": "integer"
+            },
+            "exe_path": {
+              "type": "keyword"
+            },
+            "cmdline": {
+              "type": "keyword",
+              "ignore_above": 4096
+            },
+            "comm": {
+              "type": "keyword"
+            },
+            "start_time": {
+              "type": "date"
+            }
+          }
+        },
+        "process_tree": {
+          "type": "nested",
+          "properties": {
+            "pid": {
+              "type": "integer"
+            },
+            "ppid": {
+              "type": "integer"
+            },
+            "comm": {
+              "type": "keyword"
+            },
+            "exe_path": {
+              "type": "keyword"
+            },
+            "start_time": {
+              "type": "date"
+            }
+          }
+        },
+        "network": {
+          "properties": {
+            "remote_ip": {
+              "type": "keyword"
+            },
+            "remote_port": {
+              "type": "integer"
+            },
+            "protocol": {
+              "type": "keyword"
+            },
+            "asn": {
+              "type": "integer"
+            },
+            "asn_org": {
+              "type": "keyword"
+            },
+            "country": {
+              "type": "keyword"
+            },
+            "countryCode": {
+              "type": "keyword"
+            },
+            "city": {
+              "type": "keyword"
+            },
+            "is_vpn": {
+              "type": "boolean"
+            },
+            "is_tor": {
+              "type": "boolean"
+            },
+            "reputation_score": {
+              "type": "integer"
+            },
+            "threat_categories": {
+              "type": "keyword"
+            }
+          }
+        },
+        "syscall_chain": {
+          "type": "keyword"
+        },
+        "mitre_techniques": {
+          "type": "nested",
+          "properties": {
+            "id": {
+              "type": "keyword"
+            },
+            "name": {
+              "type": "keyword"
+            },
+            "tactic": {
+              "type": "keyword"
+            },
+            "url": {
+              "type": "keyword"
+            }
+          }
+        },
+        "fired_rules": {
+          "type": "keyword"
+        },
+        "host_info": {
+          "properties": {
+            "hostname": {
+              "type": "keyword"
+            },
+            "os": {
+              "type": "keyword"
+            },
+            "kernel_version": {
+              "type": "keyword"
+            },
+            "agent_version": {
+              "type": "keyword"
+            }
+          }
+        }
+      }
+    }
+  },
+  "_meta": {
+    "description": "Index template for ReverseShellAlert documents emitted by RSBP",
+    "owner": "rsbp",
+    "schema": "internal/alert/alert.go"
+  }
+}

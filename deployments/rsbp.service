@@ -1,0 +1,17 @@
+[Unit]
+Description=Reverse Shell Behaviour Profiler
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/rsbpd run --config /etc/rsbp/rsbp.yaml
+AmbientCapabilities=CAP_SYS_ADMIN CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_OVERRIDE
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_OVERRIDE
+NoNewPrivileges=no
+ProtectSystem=strict
+ReadWritePaths=/var/log/rsbp /var/lib/rsbp
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

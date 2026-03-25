@@ -1,0 +1,14 @@
+apiVersion: 1
+datasources:
+  - name: Elasticsearch
+    type: elasticsearch
+    uid: rsbp-es
+    url: http://elasticsearch:9200
+    access: proxy
+    isDefault: true
+    jsonData:
+      index: "rsbp-alerts-*"
+      timeField: "@timestamp"
+      esVersion: "8.13.0"
+      logMessageField: id
+      logLevelField: severity

@@ -1,0 +1,76 @@
+version: '3.8'
+
+services:
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.13.0
+    container_name: rsbp-elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - xpack.security.http.ssl.enabled=false
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+    ports:
+      - "9200:9200"
+    volumes:
+      - esdata:/usr/share/elasticsearch/data
+    networks:
+      - rsbp-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9200"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.13.0
+    container_name: rsbp-kibana
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+    ports:
+      - "5601:5601"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    networks:
+      - rsbp-net
+
+  grafana:
+    image: grafana/grafana:10.4.0
+    container_name: rsbp-grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=rsbp123
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_INSTALL_PLUGINS=grafana-worldmap-panel
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafanadata:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    networks:
+      - rsbp-net
+
+  filebeat:
+    image: docker.elastic.co/beats/filebeat:8.13.0
+    container_name: rsbp-filebeat
+    user: root
+    volumes:
+      - ./filebeat/filebeat.yml:/usr/share/filebeat/filebeat.yml:ro
+      - /var/log/rsbp:/var/log/rsbp:ro
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    networks:
+      - rsbp-net
+    command: filebeat -e -strict.perms=false
+
+volumes:
+  esdata:
+  grafanadata:
+
+networks:
+  rsbp-net:
+    driver: bridge
