@@ -46,15 +46,23 @@ func NewJSONLSink(cfg JSONLSinkConfig, logger *zap.Logger) (*JSONLSink, error) {
 		return nil, err
 	}
 	ownerUID, ownerGID := resolveOwnerIDs()
-	_ = os.Chmod(filepath.Dir(cfg.Path), 0o755)
-	_ = os.Chown(filepath.Dir(cfg.Path), ownerUID, ownerGID)
+	if err := os.Chmod(filepath.Dir(cfg.Path), 0o755); err != nil {
+		logger.Debug("failed to set permissions on directory", zap.String("path", filepath.Dir(cfg.Path)), zap.Error(err))
+	}
+	if err := os.Chown(filepath.Dir(cfg.Path), ownerUID, ownerGID); err != nil {
+		logger.Debug("failed to set ownership on directory", zap.String("path", filepath.Dir(cfg.Path)), zap.Error(err))
+	}
 
 	f, err := os.OpenFile(cfg.Path, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0o644)
 	if err != nil {
 		return nil, err
 	}
-	_ = f.Chmod(0o644)
-	_ = f.Chown(ownerUID, ownerGID)
+	if err := f.Chmod(0o644); err != nil {
+		logger.Debug("failed to set permissions on file", zap.String("path", cfg.Path), zap.Error(err))
+	}
+	if err := f.Chown(ownerUID, ownerGID); err != nil {
+		logger.Debug("failed to set ownership on file", zap.String("path", cfg.Path), zap.Error(err))
+	}
 
 	s := &JSONLSink{
 		name:    "jsonl",
@@ -92,25 +100,37 @@ func (s *JSONLSink) Send(_ context.Context, alert *alertpkg.ReverseShellAlert) e
 
 	// Atomic write via temp file + rename to avoid partial JSON corruption.
 	tmp := s.path + ".tmp"
-	oldData, _ := os.ReadFile(s.path)
+	oldData, err := os.ReadFile(s.path)
+	if err != nil && !os.IsNotExist(err) {
+		s.logger.Warn("failed to read existing file for atomic append", zap.String("path", s.path), zap.Error(err))
+		oldData = nil
+	}
 	if err := os.WriteFile(tmp, append(append(oldData, line...), '\n'), 0o644); err != nil {
 		return err
 	}
 	ownerUID, ownerGID := resolveOwnerIDs()
-	_ = os.Chown(tmp, ownerUID, ownerGID)
+	if err := os.Chown(tmp, ownerUID, ownerGID); err != nil {
+		s.logger.Debug("failed to set ownership on temp file", zap.String("path", tmp), zap.Error(err))
+	}
 	if err := os.Rename(tmp, s.path); err != nil {
 		return err
 	}
 
 	if s.file != nil {
-		_ = s.file.Close()
+		if err := s.file.Close(); err != nil {
+			s.logger.Warn("failed to close file before reopen", zap.String("path", s.path), zap.Error(err))
+		}
 	}
 	f, err := os.OpenFile(s.path, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0o644)
 	if err != nil {
 		return err
 	}
-	_ = f.Chmod(0o644)
-	_ = f.Chown(ownerUID, ownerGID)
+	if err := f.Chmod(0o644); err != nil {
+		s.logger.Debug("failed to set permissions on file", zap.String("path", s.path), zap.Error(err))
+	}
+	if err := f.Chown(ownerUID, ownerGID); err != nil {
+		s.logger.Debug("failed to set ownership on file", zap.String("path", s.path), zap.Error(err))
+	}
 	s.file = f
 	return nil
 }
@@ -154,13 +174,19 @@ func (s *JSONLSink) rotateIfNeededLocked() error {
 		return nil
 	}
 	if s.file != nil {
-		_ = s.file.Sync()
-		_ = s.file.Close()
+		if err := s.file.Sync(); err != nil {
+			s.logger.Warn("failed to sync file before rotation", zap.String("path", s.path), zap.Error(err))
+		}
+		if err := s.file.Close(); err != nil {
+			s.logger.Warn("failed to close file before rotation", zap.String("path", s.path), zap.Error(err))
+		}
 	}
 
 	rotated := filepath.Join(filepath.Dir(s.path), fmt.Sprintf("alerts.%s.jsonl", s.dateKey))
 	if _, err := os.Stat(s.path); err == nil {
-		_ = os.Rename(s.path, rotated)
+		if err := os.Rename(s.path, rotated); err != nil {
+			s.logger.Warn("failed to rotate log file", zap.String("from", s.path), zap.String("to", rotated), zap.Error(err))
+		}
 	}
 
 	s.dateKey = today
@@ -168,9 +194,13 @@ func (s *JSONLSink) rotateIfNeededLocked() error {
 	if err != nil {
 		return err
 	}
-	_ = f.Chmod(0o644)
+	if err := f.Chmod(0o644); err != nil {
+		s.logger.Debug("failed to set permissions on rotated file", zap.String("path", s.path), zap.Error(err))
+	}
 	ownerUID, ownerGID := resolveOwnerIDs()
-	_ = f.Chown(ownerUID, ownerGID)
+	if err := f.Chown(ownerUID, ownerGID); err != nil {
+		s.logger.Debug("failed to set ownership on rotated file", zap.String("path", s.path), zap.Error(err))
+	}
 	s.file = f
 
 	return pruneOldRotations(filepath.Dir(s.path), 30)

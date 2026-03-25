@@ -16,12 +16,12 @@ import (
 )
 
 type KafkaConfig struct {
-	Brokers   []string `mapstructure:"brokers"`
-	Topic     string   `mapstructure:"topic"`
-	Username  string   `mapstructure:"username"`
-	Password  string   `mapstructure:"password"`
-	EnableTLS bool     `mapstructure:"enable_tls"`
-	EnableSASL bool    `mapstructure:"enable_sasl"`
+	Brokers    []string `mapstructure:"brokers"`
+	Topic      string   `mapstructure:"topic"`
+	Username   string   `mapstructure:"username"`
+	Password   string   `mapstructure:"password"`
+	EnableTLS  bool     `mapstructure:"enable_tls"`
+	EnableSASL bool     `mapstructure:"enable_sasl"`
 }
 
 type KafkaSink struct {

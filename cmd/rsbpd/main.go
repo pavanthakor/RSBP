@@ -268,7 +268,11 @@ func writeCrashReport(details panicDetails) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() {
+		if closeErr := f.Close(); closeErr != nil {
+			fmt.Fprintf(os.Stderr, "warning: failed to close crash log: %v\n", closeErr)
+		}
+	}()
 
 	_, err = fmt.Fprintf(f,
 		"[%s] panic in %s: %v\n%s\n",
@@ -322,7 +326,9 @@ func assertWritableDir(dir string) error {
 		return err
 	}
 	name := tmpFile.Name()
-	_ = tmpFile.Close()
+	if closeErr := tmpFile.Close(); closeErr != nil {
+		return closeErr
+	}
 	return os.Remove(name)
 }
 
@@ -468,7 +474,9 @@ func runDaemon(configPath string) error {
 	}
 
 	if cfg.RSBP.Agent.PIDFile != "" {
-		_ = os.WriteFile(cfg.RSBP.Agent.PIDFile, []byte(strconv.Itoa(os.Getpid())), 0o644)
+		if err := os.WriteFile(cfg.RSBP.Agent.PIDFile, []byte(strconv.Itoa(os.Getpid())), 0o644); err != nil {
+			logger.Warn("failed to write PID file", zap.String("path", cfg.RSBP.Agent.PIDFile), zap.Error(err))
+		}
 		defer os.Remove(cfg.RSBP.Agent.PIDFile)
 	}
 
@@ -526,6 +534,11 @@ func runDaemon(configPath string) error {
 		AbuseIPDBAPIKey:  cfg.RSBP.Enrichment.AbuseIPDBAPIKey,
 		AbuseIPDBEnabled: cfg.RSBP.Enrichment.AbuseIPDBAPIKey != "",
 	}, logger)
+	defer func() {
+		if err := enricher.Close(); err != nil {
+			logger.Warn("failed to close enricher", zap.Error(err))
+		}
+	}()
 	collector := forensics.NewCollector(forensics.Config{
 		ArtifactDir:    cfg.RSBP.Forensics.OutputDir,
 		EnableMiniPCAP: cfg.RSBP.Forensics.Enabled && cfg.RSBP.Forensics.CapturePCAP,

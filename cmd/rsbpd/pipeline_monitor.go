@@ -264,13 +264,13 @@ func (p *pipelineTracker) deepHealth(ebpfLoaded bool, ebpfLostEvents uint64) map
 
 	return map[string]any{
 		"ebpf_status": map[string]any{
-			"loaded":        ebpfLoaded,
+			"loaded":         ebpfLoaded,
 			"dropped_events": ebpfLostEvents,
 		},
 		"event_flow": map[string]any{
-			"events_per_sec":             float64(p.eventsPerSecondTimes100.Load()) / 100.0,
-			"events_total":               p.eventsSeen.Load(),
-			"seconds_since_last_event":   eventAge,
+			"events_per_sec":               float64(p.eventsPerSecondTimes100.Load()) / 100.0,
+			"events_total":                 p.eventsSeen.Load(),
+			"seconds_since_last_event":     eventAge,
 			"dead_pipeline_warnings_total": p.deadPipelineWarn.Load(),
 		},
 		"detection_active": map[string]any{
@@ -279,9 +279,9 @@ func (p *pipelineTracker) deepHealth(ebpfLoaded bool, ebpfLostEvents uint64) map
 			"seconds_since_last_alert": alertAge,
 		},
 		"output_active": map[string]any{
-			"alerts_emitted":                p.alertsEmitted.Load(),
-			"seconds_since_last_output":     outputAge,
-			"blocked_channel_sends_total":   p.blockedChannelSends.Load(),
+			"alerts_emitted":                  p.alertsEmitted.Load(),
+			"seconds_since_last_output":       outputAge,
+			"blocked_channel_sends_total":     p.blockedChannelSends.Load(),
 			"channel_overflow_warnings_total": p.channelOverflowWarn.Load(),
 		},
 		"synthetic_check": map[string]any{

@@ -19,23 +19,23 @@ import (
 )
 
 type ElasticsearchConfig struct {
-	Addresses   []string `mapstructure:"addresses"`
-	Username    string   `mapstructure:"username"`
-	Password    string   `mapstructure:"password"`
-	CertPath    string   `mapstructure:"cert_path"`
-	SkipVerify  bool     `mapstructure:"skip_verify"`
-	TemplateName string  `mapstructure:"template_name"`
+	Addresses    []string `mapstructure:"addresses"`
+	Username     string   `mapstructure:"username"`
+	Password     string   `mapstructure:"password"`
+	CertPath     string   `mapstructure:"cert_path"`
+	SkipVerify   bool     `mapstructure:"skip_verify"`
+	TemplateName string   `mapstructure:"template_name"`
 }
 
 type ESSink struct {
-	client   *elasticsearch.Client
-	logger   *zap.Logger
-	name     string
-	buffer   []*alertpkg.ReverseShellAlert
-	mu       sync.Mutex
-	ticker   *time.Ticker
-	stopCh   chan struct{}
-	stopped  chan struct{}
+	client  *elasticsearch.Client
+	logger  *zap.Logger
+	name    string
+	buffer  []*alertpkg.ReverseShellAlert
+	mu      sync.Mutex
+	ticker  *time.Ticker
+	stopCh  chan struct{}
+	stopped chan struct{}
 }
 
 func NewESSink(cfg ElasticsearchConfig, logger *zap.Logger) (*ESSink, error) {
