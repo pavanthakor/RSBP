@@ -99,3 +99,66 @@ tail -f /var/log/rsbp/alerts.jsonl | python3 -m json.tool
 | /whitelist | POST | Add whitelist entry |
 | /reload | POST | Hot reload config |
 | /test | POST | Inject synthetic event |
+
+## Step-by-Step Runbook
+
+Use this sequence for a clean operator workflow in development or staging.
+
+### 1) Build and verify
+
+```bash
+make build
+go test ./...
+```
+
+### 2) Start full stack (daemon + monitoring)
+
+```bash
+./scripts/full-stack.sh up
+```
+
+This starts:
+- RSBP daemon (`rsbpd`)
+- Elasticsearch
+- Kibana
+- Grafana
+- Filebeat
+
+### 3) Confirm health
+
+```bash
+./scripts/status-rsbp.sh
+curl -s http://127.0.0.1:9001/health
+curl -s http://127.0.0.1:9001/stats
+```
+
+### 4) Run end-to-end detection smoke test
+
+```bash
+bash test/simulate/attack_sim.sh
+```
+
+Then verify sinks:
+
+```bash
+sudo tail -n 20 /var/log/rsbp/alerts.jsonl
+curl -s http://127.0.0.1:9200/_cat/indices?v | grep rsbp-alerts
+```
+
+### 5) Use dashboards
+
+- Grafana: `http://127.0.0.1:3000` (`admin` / `rsbp123`)
+- Kibana: `http://127.0.0.1:5601`
+
+### 6) Stop stack cleanly
+
+```bash
+./scripts/full-stack.sh down
+```
+
+### 7) Troubleshooting checklist
+
+1. `alerts_emitted=0` but events rise: inspect whitelist/suppression and score threshold.
+2. Elasticsearch reachable but no docs: inspect Filebeat logs and output sink logs.
+3. Daemon not healthy: check `/var/log/rsbp/daemon.log` and privileges (CAP_BPF/root).
+4. WSL path issues: run from native Linux path (avoid restrictive `/mnt` policy contexts).

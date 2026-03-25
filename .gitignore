@@ -1,0 +1,40 @@
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# --- Local Python env ---
+.venv/
+
+# --- Build artifacts ---
+bin/
+rsbpd
+*.exe
+*.dll
+*.so
+*.dylib
+
+# --- Runtime / debug logs ---
+*.log
+debug_*.log
+
+# --- Coverage / reports generated locally ---
+cover
+coverage.txt
+detection_cov.txt
+*.coverprofile
+coverage.out
+
+# --- Local backups / temp ---
+*.bak
+*.tmp
+*.temp
+
+# --- Secrets / local env ---
+.env
+.env.*
+!.env.example
+
+# --- eBPF intermediate files (generated locally) ---
+*.d
