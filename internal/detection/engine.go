@@ -146,9 +146,16 @@ func (e *Engine) Evaluate(state *correlation.SessionState, ev types.SyscallEvent
 	if ruleEval.Score > baseScore {
 		baseScore = ruleEval.Score
 	}
-	e.logger.Debug("detection evaluating session",
+	e.logger.Info("DETECTION DECISION",
 		zap.Uint32("pid", state.PID),
+		zap.String("exe", state.ExePath),
+		zap.String("cmdline", state.Cmdline),
 		zap.Float64("score", baseScore),
+		zap.Float64("rule_score", ruleEval.Score),
+		zap.Bool("complete", state.IsComplete()),
+		zap.Bool("has_socket", state.HasSocket),
+		zap.Bool("has_dup", state.HasDupToStdio),
+		zap.String("remote_ip", state.RemoteIP.String()),
 		zap.String("pipeline_stage", "detection"),
 	)
 
@@ -158,18 +165,19 @@ func (e *Engine) Evaluate(state *correlation.SessionState, ev types.SyscallEvent
 		minScore = 0.50
 	}
 
-	if suppressed, reason := e.isWhitelisted(state); suppressed {
+	// RELAX WHITELIST: Only apply if NO suspicious behavior (i.e. not IsComplete)
+	if suppressed, reason := e.isWhitelisted(state); suppressed && !state.IsComplete() {
 		label := "whitelist"
 		if strings.TrimSpace(reason) != "" {
 			label = strings.TrimSpace(reason)
 		}
 		detectionsSuppressedCounter.WithLabelValues(label).Inc()
 		e.suppressedCount.Add(1)
-		e.logger.Debug("session suppressed by whitelist",
+		e.logger.Info("SUPPRESSED",
+			zap.String("reason", label),
 			zap.Uint32("pid", state.PID),
 			zap.String("exe", state.ExePath),
 			zap.String("remote_ip", state.RemoteIP.String()),
-			zap.String("reason", reason),
 			zap.String("pipeline_stage", "detection"),
 		)
 		return nil
@@ -361,11 +369,14 @@ func (e *Engine) behaviorScore(state *correlation.SessionState) float64 {
 	isRSTool := isNeverSuppressProcess(toolName)
 	if isRSTool && state.HasConnect {
 		score := 0.55
+		if state.RemoteIP != nil && (state.RemoteIP.IsPrivate() || state.RemoteIP.IsLoopback()) {
+			score -= 0.20
+		}
 		if state.HasSocket {
 			score += 0.15
 		}
 		if state.HasDupToStdio {
-			score += 0.20
+			score += 0.30
 		}
 		if state.HasExecve {
 			score += 0.10
@@ -385,6 +396,9 @@ func (e *Engine) behaviorScore(state *correlation.SessionState) float64 {
 
 	if isRSTool && state.HasDupToStdio {
 		score := 0.60
+		if state.RemoteIP != nil && (state.RemoteIP.IsPrivate() || state.RemoteIP.IsLoopback()) {
+			score -= 0.20
+		}
 		if state.HasConnect {
 			score += 0.15
 		}
@@ -410,6 +424,9 @@ func (e *Engine) behaviorScore(state *correlation.SessionState) float64 {
 	cmdlineLower := strings.ToLower(state.Cmdline)
 
 	score := 0.55
+	if state.RemoteIP != nil && (state.RemoteIP.IsPrivate() || state.RemoteIP.IsLoopback()) {
+		score -= 0.20
+	}
 	if state.HasSocket {
 		score += 0.10
 	}
@@ -417,7 +434,7 @@ func (e *Engine) behaviorScore(state *correlation.SessionState) float64 {
 		score += 0.15
 	}
 	if state.HasDupToStdio {
-		score += 0.20
+		score += 0.40
 	}
 	if state.HasForkWithPipe {
 		score += 0.10
@@ -448,6 +465,11 @@ func (e *Engine) behaviorScore(state *correlation.SessionState) float64 {
 	}
 	if (strings.Contains(toolName, "python") || strings.Contains(strings.ToLower(state.ExePath), "python") || strings.Contains(cmdlineLower, "python")) && !state.HasForkWithPipe && score > 0.69 {
 		score = 0.69
+	}
+
+	// ENSURE SESSION COMPLETION TRIGGERS DETECTION
+	if state.IsComplete() && score < 0.60 {
+		score = 0.60
 	}
 
 	if score > 1 {

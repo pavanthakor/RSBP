@@ -40,8 +40,8 @@ type SessionState struct {
 }
 
 var ShellBinaries = map[string]struct{}{
-	"sh":               {},
 	"bash":             {},
+	"sh":               {},
 	"zsh":              {},
 	"dash":             {},
 	"ksh":              {},
@@ -117,8 +117,6 @@ var builtInProcessWhitelist = map[string]struct{}{
 }
 
 var reverseShellProcessExceptionSet = map[string]struct{}{
-	"bash":    {},
-	"sh":      {},
 	"python3": {},
 	"python":  {},
 	"nc":      {},
@@ -152,9 +150,6 @@ var builtInPathWhitelistContains = []string{
 var builtInIgnoredCIDRs = []string{
 	"127.0.0.0/8",
 	"::1/128",
-	"10.0.0.0/8",
-	"172.16.0.0/12",
-	"192.168.0.0/16",
 	"169.254.0.0/16",
 }
 
@@ -222,26 +217,8 @@ func (s *SessionState) IsComplete() bool {
 
 	cat := s.CategoryDetect()
 	s.Category = cat
-	if cat <= 0 {
-		return false
-	}
 
-	if !s.HasExecve || !s.HasConnect {
-		return false
-	}
-
-	if s.RemoteIP == nil || s.RemoteIP.IsUnspecified() {
-		return false
-	}
-	if s.RemotePort == 0 {
-		return false
-	}
-
-	if !allowPrivateRemoteFlag.Load() && !isPublicRemoteIP(s.RemoteIP) {
-		return false
-	}
-
-	return true
+	return s.HasExecve && s.HasConnect && (s.HasDupToStdio || s.HasSocket || cat > 0)
 }
 
 func (s *SessionState) ProcessName() string {

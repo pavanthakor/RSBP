@@ -91,10 +91,11 @@ var (
 			if in.Session == nil {
 				return false
 			}
-			if !(in.Session.HasSocket || in.Session.HasDupToStdio || in.Session.HasForkWithPipe) {
-				return false
-			}
-			return in.Session.CategoryDetect() > 0 && in.Session.IsComplete()
+			s := in.Session
+			// Evaluate directly without calling IsComplete() to avoid
+			// circular dependency with allowPrivateRemoteFlag and category gating.
+			return s.HasExecve && s.HasConnect &&
+				(s.HasDupToStdio || s.HasSocket || s.HasForkWithPipe)
 		},
 	}
 

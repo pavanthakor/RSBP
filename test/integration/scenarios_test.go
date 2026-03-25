@@ -51,14 +51,16 @@ func TestEndToEndScenarios(t *testing.T) {
 			ExpectedMITRE:    []string{"T1059", "T1104"},
 		},
 		{
-			Name: "private target suppressed",
+			Name: "private target allowed with strong behavior",
 			Events: []types.SyscallEvent{
 				event(3004, 1, 59, "/bin/bash", "bash -i", 0, "", 0),
 				event(3004, 2, 41, "/bin/bash", "", 3, "", 0),
 				event(3004, 3, 42, "/bin/bash", "", 3, "192.168.1.10", 4444),
 				event(3004, 4, 33, "/bin/bash", "", 3, "", 0),
 			},
-			ExpectedFired: false,
+			ExpectedFired:    true,
+			ExpectedSeverity: types.SeverityHigh,
+			ExpectedMITRE:    []string{"T1059", "T1104"},
 		},
 		{
 			Name: "timing window exceeded suppressed",

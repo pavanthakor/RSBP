@@ -129,35 +129,40 @@ func TestLowLevelHelpers(t *testing.T) {
 	}
 }
 
-func TestSessionIsCompletePrivateRemotePolicy(t *testing.T) {
-	base := &SessionState{
+func TestSessionIsCompleteBehavior(t *testing.T) {
+	// IsComplete should now only test behavior signals.
+	incomplete := &SessionState{
+		PID:        9002,
+		ExePath:    "/bin/bash",
+		HasExecve:  true,
+		HasConnect: false, // Incomplete
+	}
+
+	if incomplete.IsComplete() {
+		t.Fatalf("expected incomplete without connect")
+	}
+
+	complete1 := &SessionState{
 		PID:           9002,
 		ExePath:       "/bin/bash",
 		HasExecve:     true,
 		HasConnect:    true,
-		HasDupToStdio: true,
-		RemoteIP:      net.ParseIP("192.168.1.10"),
-		RemotePort:    4444,
+		HasDupToStdio: true, // Complete via dup
+	}
+	if !complete1.IsComplete() {
+		t.Fatalf("expected complete with execve, connect, and dup")
 	}
 
-	SetAllowPrivateRemote(false)
-	if base.IsComplete() {
-		t.Fatalf("expected private target to be incomplete when allowPrivateRemote=false")
+	complete2 := &SessionState{
+		PID:        9002,
+		ExePath:    "/bin/bash",
+		HasExecve:  true,
+		HasConnect: true,
+		HasSocket:  true, // Complete via socket
 	}
-
-	SetAllowPrivateRemote(true)
-	if !base.IsComplete() {
-		t.Fatalf("expected private target to complete when allowPrivateRemote=true")
+	if !complete2.IsComplete() {
+		t.Fatalf("expected complete with execve, connect, and socket")
 	}
-
-	public := *base
-	public.RemoteIP = net.ParseIP("8.8.8.8")
-	SetAllowPrivateRemote(false)
-	if !public.IsComplete() {
-		t.Fatalf("expected public target to complete when allowPrivateRemote=false")
-	}
-
-	SetAllowPrivateRemote(true)
 }
 
 func TestCategoryDetectDirectPatterns(t *testing.T) {

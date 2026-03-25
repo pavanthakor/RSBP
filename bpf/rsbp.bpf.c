@@ -166,20 +166,10 @@ int trace_enter_socket(struct trace_event_raw_sys_enter *ctx)
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     __u32 pid = (__u32)(pid_tgid >> 32);
     struct socket_enter_state st = {};
-    struct syscall_event *evt;
 
     st.family = (__u16)read_enter_arg(ctx, 0);
     bpf_map_update_elem(&socket_enter_map, &pid, &st, BPF_ANY);
 
-    evt = bpf_ringbuf_reserve(&events, sizeof(*evt), 0);
-    if (!evt)
-        return 0;
-
-    __builtin_memset(evt, 0, sizeof(*evt));
-    fill_common(evt, __NR_socket, -1);
-    evt->has_socket = 1;
-    evt->family = st.family;
-    bpf_ringbuf_submit(evt, 0);
     return 0;
 }
 

@@ -7,6 +7,7 @@ correlation:
   window_seconds: 5
   cleanup_interval_seconds: 30
 detection:
+  allow_private_remote: true
   score_threshold: 0.5
   score_threshold_critical: 0.9
   score_threshold_high: 0.7

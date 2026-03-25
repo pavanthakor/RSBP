@@ -193,7 +193,7 @@ func (e *Engine) Process(event types.SyscallEvent) {
 			UpdatedAt:  now,
 		})
 
-		if parentAny, ok := e.sessions.Load(session.PPID); ok {
+		if parentAny, ok := e.sessions.Load(session.PPID); ok && isPublicRemoteIP(session.RemoteIP) {
 			if parent, ok := parentAny.(*SessionState); ok && parent != nil {
 				parent.HasConnect = true
 				if parent.SocketFD < 0 && session.SocketFD >= 0 {

@@ -234,8 +234,8 @@ func injectDefaults(cfg *appConfig, normalized map[string]any) []appliedDefault 
 		defaults = append(defaults, appliedDefault{Field: "rsbp.detection.window_seconds", Value: 5})
 	}
 	if !hasPath(normalized, "rsbp.detection.score_threshold") || cfg.RSBP.Detection.ScoreThreshold == 0 {
-		cfg.RSBP.Detection.ScoreThreshold = 0.75
-		defaults = append(defaults, appliedDefault{Field: "rsbp.detection.score_threshold", Value: 0.75})
+		cfg.RSBP.Detection.ScoreThreshold = 0.50
+		defaults = append(defaults, appliedDefault{Field: "rsbp.detection.score_threshold", Value: 0.50})
 	}
 	if !hasPath(normalized, "rsbp.detection.allow_private_remote") {
 		cfg.RSBP.Detection.AllowPrivateRemote = true
