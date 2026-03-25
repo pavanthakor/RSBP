@@ -103,6 +103,16 @@ func NewEnricher(cfg Config, logger *zap.Logger) *Enricher {
 	}
 }
 
+func (e *Enricher) Close() error {
+	if e == nil {
+		return nil
+	}
+	if e.cache != nil {
+		e.cache.Stop()
+	}
+	return nil
+}
+
 func (e *Enricher) Enrich(ctx context.Context, s *correlation.SessionState) (*Result, error) {
 	start := time.Now()
 	if e == nil {
