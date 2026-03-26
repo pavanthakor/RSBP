@@ -52,6 +52,21 @@ type DegradedSink struct {
 	lastReconnect time.Time
 }
 
+func (d *DegradedSink) emitToFallback(ctx context.Context, alert *alertpkg.ReverseShellAlert, alertLogger *zap.Logger) {
+	if d == nil || d.fallback == nil || alert == nil {
+		return
+	}
+	if err := d.fallback.Send(ctx, alert); err != nil {
+		incSinkFailed(d.fallback.Name())
+		if alertLogger != nil {
+			alertLogger.Warn("fallback sink write failed", zap.Error(err))
+		}
+		return
+	}
+	incSinkEmitted(d.fallback.Name())
+	_ = d.fallback.Flush()
+}
+
 type Config struct {
 	Enabled       []string            `mapstructure:"enabled"`
 	Elasticsearch ElasticsearchConfig `mapstructure:"elasticsearch"`
@@ -136,10 +151,7 @@ func (d *DegradedSink) Send(ctx context.Context, alert *alertpkg.ReverseShellAle
 
 	if degraded {
 		d.bufferAlert(alert)
-		if d.fallback != nil {
-			_ = d.fallback.Send(ctx, alert)
-			_ = d.fallback.Flush()
-		}
+		d.emitToFallback(ctx, alert, alertLogger)
 		d.tryRecover(ctx, alertLogger)
 		return nil
 	}
@@ -157,12 +169,7 @@ func (d *DegradedSink) Send(ctx context.Context, alert *alertpkg.ReverseShellAle
 	d.failures = 0
 	d.mu.Unlock()
 
-	if d.fallback != nil {
-		if err := d.fallback.Send(ctx, alert); err != nil {
-			alertLogger.Warn("fallback sink write failed", zap.Error(err))
-		}
-		_ = d.fallback.Flush()
-	}
+	d.emitToFallback(ctx, alert, alertLogger)
 	return nil
 }
 
@@ -179,10 +186,7 @@ func (d *DegradedSink) onPrimaryFailure(ctx context.Context, alert *alertpkg.Rev
 
 	if degraded {
 		d.bufferAlert(alert)
-		if d.fallback != nil {
-			_ = d.fallback.Send(ctx, alert)
-			_ = d.fallback.Flush()
-		}
+		d.emitToFallback(ctx, alert, alertLogger)
 		return nil
 	}
 
