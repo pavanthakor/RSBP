@@ -27,8 +27,8 @@ processors:
 
 output.elasticsearch:
   hosts: ["elasticsearch:9200"]
-  index: "rsbp-current"
+  # Match the Grafana datasource + dashboard index pattern (rsbp-alerts-*).
+  index: "rsbp-alerts-%{+yyyy.MM.dd}"
 
 setup.ilm.enabled: false
-setup.template.name: "rsbp-alerts"
-setup.template.pattern: "rsbp-alerts-*"
+setup.template.enabled: false
