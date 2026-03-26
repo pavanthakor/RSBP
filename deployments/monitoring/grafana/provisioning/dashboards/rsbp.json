@@ -65,16 +65,26 @@
               "type": "count"
             }
           ],
-          "bucketAggs": []
+          "bucketAggs": [
+            {
+              "field": "@timestamp",
+              "id": "2",
+              "settings": {
+                "interval": "auto",
+                "min_doc_count": "0"
+              },
+              "type": "date_histogram"
+            }
+          ]
         }
       ],
       "options": {
         "reduceOptions": {
-          "values": false,
           "calcs": [
-            "lastNotNull"
+            "sum"
           ],
-          "fields": ""
+          "fields": "",
+          "values": false
         },
         "orientation": "auto",
         "textMode": "auto",
@@ -134,16 +144,26 @@
               "type": "count"
             }
           ],
-          "bucketAggs": []
+          "bucketAggs": [
+            {
+              "field": "@timestamp",
+              "id": "2",
+              "settings": {
+                "interval": "auto",
+                "min_doc_count": "0"
+              },
+              "type": "date_histogram"
+            }
+          ]
         }
       ],
       "options": {
         "reduceOptions": {
-          "values": false,
           "calcs": [
-            "lastNotNull"
+            "sum"
           ],
-          "fields": ""
+          "fields": "",
+          "values": false
         },
         "orientation": "auto",
         "textMode": "auto",
@@ -203,16 +223,26 @@
               "type": "count"
             }
           ],
-          "bucketAggs": []
+          "bucketAggs": [
+            {
+              "field": "@timestamp",
+              "id": "2",
+              "settings": {
+                "interval": "auto",
+                "min_doc_count": "0"
+              },
+              "type": "date_histogram"
+            }
+          ]
         }
       ],
       "options": {
         "reduceOptions": {
-          "values": false,
           "calcs": [
-            "lastNotNull"
+            "sum"
           ],
-          "fields": ""
+          "fields": "",
+          "values": false
         },
         "orientation": "auto",
         "textMode": "auto",
@@ -272,16 +302,26 @@
               "type": "count"
             }
           ],
-          "bucketAggs": []
+          "bucketAggs": [
+            {
+              "field": "@timestamp",
+              "id": "2",
+              "settings": {
+                "interval": "auto",
+                "min_doc_count": "0"
+              },
+              "type": "date_histogram"
+            }
+          ]
         }
       ],
       "options": {
         "reduceOptions": {
-          "values": false,
           "calcs": [
-            "lastNotNull"
+            "sum"
           ],
-          "fields": ""
+          "fields": "",
+          "values": false
         },
         "orientation": "auto",
         "textMode": "auto",

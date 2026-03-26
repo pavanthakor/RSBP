@@ -68,4 +68,5 @@ output:
     enabled: false
 api:
   listen_addr: 127.0.0.1:9001
+  metrics_listen: 0.0.0.0:9090
   enabled: true
