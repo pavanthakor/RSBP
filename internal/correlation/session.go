@@ -261,8 +261,9 @@ func (s *SessionState) IsComplete() bool {
 		return false
 	}
 
-	// Only enforce public-remote constraints for non-tools; RS tools are often tested
-	// against RFC1918 targets.
+	// Only enforce public-remote constraints for non-tools; reverse shell tools are
+	// commonly tested against RFC1918 targets and the correlation layer focuses on
+	// behavior rather than remote reputation.
 	if !isRSTool && !allowPrivateRemoteFlag.Load() && !isPublicRemoteIP(s.RemoteIP) {
 		return false
 	}

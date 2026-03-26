@@ -1,0 +1,1 @@
+{queries:[{refId:A,datasource:{type:elasticsearch,uid:rsbp-es},timeRange:{from:now-24h,to:now},query:pattern:*,metrics:[{id:1,type:count}],bucketAggs:[{type:terms,field:pattern,id:2,settings:{min_doc_count:1,size:10}}]}]}

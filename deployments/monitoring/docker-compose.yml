@@ -24,7 +24,8 @@ services:
       - xpack.security.http.ssl.enabled=false
       - ES_JAVA_OPTS=-Xms512m -Xmx512m
     ports:
-      - "9200:9200"
+      # Use non-default host ports to avoid collisions with other local stacks.
+      - "9201:9200"
     volumes:
       - esdata:/usr/share/elasticsearch/data
     networks:
@@ -41,7 +42,7 @@ services:
     environment:
       - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
     ports:
-      - "5601:5601"
+      - "5602:5601"
     depends_on:
       elasticsearch:
         condition: service_healthy
@@ -56,7 +57,7 @@ services:
       - GF_SECURITY_ADMIN_USER=admin
       - GF_INSTALL_PLUGINS=grafana-worldmap-panel
     ports:
-      - "3000:3000"
+      - "3001:3000"
     volumes:
       - grafanadata:/var/lib/grafana
       - ./grafana/provisioning:/etc/grafana/provisioning

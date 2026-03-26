@@ -51,7 +51,7 @@ func TestEvaluateSuppressedWhenBelowMinScore(t *testing.T) {
 	eng := NewEngine(Config{ExecConnectWindowSeconds: 10, MinScore: 0.9}, zap.NewNop())
 	state := &correlation.SessionState{
 		PID:        55,
-		ExePath:    "/bin/bash",
+		ExePath:    "/bin/customtool",
 		HasExecve:  true,
 		HasConnect: true,
 		RemoteIP:   net.ParseIP("8.8.8.8"),

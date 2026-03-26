@@ -141,9 +141,14 @@ var scriptChildExecutables = map[string]struct{}{
 }
 
 var neverSuppressProcessNames = map[string]struct{}{
-	"nc":     {},
-	"netcat": {},
-	"ncat":   {},
+	"bash":    {},
+	"sh":      {},
+	"python3": {},
+	"python":  {},
+	"nc":      {},
+	"netcat":  {},
+	"ncat":    {},
+	"dash":    {},
 }
 
 var (

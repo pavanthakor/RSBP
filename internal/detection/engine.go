@@ -160,7 +160,22 @@ func (e *Engine) Evaluate(state *correlation.SessionState, ev types.SyscallEvent
 	)
 
 	commClean := strings.ToLower(strings.TrimSpace(processNameFromSession(state)))
+
+	neverSuppressTools := map[string]bool{
+		"bash":    true,
+		"sh":      true,
+		"python3": true,
+		"python":  true,
+		"nc":      true,
+		"netcat":  true,
+		"ncat":    true,
+		"dash":    true,
+	}
+
 	minScore := e.cfg.MinScore
+	if neverSuppressTools[commClean] && minScore > 0.50 {
+		minScore = 0.50
+	}
 	if isNeverSuppressSession(state) || isNeverSuppressProcess(commClean) {
 		minScore = 0.50
 	}
@@ -525,6 +540,15 @@ func (e *Engine) isWhitelisted(state *correlation.SessionState) (bool, string) {
 	}
 
 	procName := processNameFromSession(state)
+
+	neverSuppress := map[string]bool{
+		"bash": true, "sh": true, "python3": true, "python": true,
+		"nc": true, "netcat": true, "ncat": true, "dash": true,
+	}
+	if neverSuppress[strings.ToLower(strings.TrimSpace(procName))] {
+		return false, ""
+	}
+
 	if isNeverSuppressSession(state) || isNeverSuppressProcess(procName) {
 		return false, ""
 	}

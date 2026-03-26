@@ -1,0 +1,187 @@
+{
+  "dashboard": {
+    "id": null,
+    "uid": "rsbp-main",
+    "title": "RSBP Live Telemetry",
+    "tags": ["rsbp", "security", "ebpf"],
+    "timezone": "browser",
+    "schemaVersion": 16,
+    "version": 0,
+    "refresh": "5s",
+    "panels": [
+      {
+        "type": "stat",
+        "title": "Total Alerts",
+        "gridPos": {"x": 0, "y": 0, "w": 6, "h": 5},
+        "datasource": {"type": "elasticsearch", "uid": "rsbp-es"},
+        "targets": [
+          {
+            "metrics": [{"type": "count", "id": "1"}],
+            "bucketAggs": [
+              {
+                "type": "date_histogram",
+                "field": "@timestamp",
+                "id": "2",
+                "settings": {"interval": "auto", "min_doc_count": "0"}
+              }
+            ],
+            "query": "*",
+            "timeField": "@timestamp"
+          }
+        ],
+        "options": {
+          "reduceOptions": {"calcs": ["sum"]}
+        }
+      },
+      {
+        "type": "stat",
+        "title": "Critical",
+        "gridPos": {"x": 6, "y": 0, "w": 6, "h": 5},
+        "datasource": {"type": "elasticsearch", "uid": "rsbp-es"},
+        "targets": [
+          {
+            "metrics": [{"type": "count", "id": "1"}],
+            "bucketAggs": [
+              {
+                "type": "date_histogram",
+                "field": "@timestamp",
+                "id": "2",
+                "settings": {"interval": "auto", "min_doc_count": "0"}
+              }
+            ],
+            "query": "severity:Critical",
+            "timeField": "@timestamp"
+          }
+        ],
+        "options": {
+          "reduceOptions": {"calcs": ["sum"]}
+        }
+      },
+      {
+        "type": "stat",
+        "title": "High",
+        "gridPos": {"x": 12, "y": 0, "w": 6, "h": 5},
+        "datasource": {"type": "elasticsearch", "uid": "rsbp-es"},
+        "targets": [
+          {
+            "metrics": [{"type": "count", "id": "1"}],
+            "bucketAggs": [
+              {
+                "type": "date_histogram",
+                "field": "@timestamp",
+                "id": "2",
+                "settings": {"interval": "auto", "min_doc_count": "0"}
+              }
+            ],
+            "query": "severity:High",
+            "timeField": "@timestamp"
+          }
+        ],
+        "options": {
+          "reduceOptions": {"calcs": ["sum"]}
+        }
+      },
+      {
+        "type": "stat",
+        "title": "Medium",
+        "gridPos": {"x": 18, "y": 0, "w": 6, "h": 5},
+        "datasource": {"type": "elasticsearch", "uid": "rsbp-es"},
+        "targets": [
+          {
+            "metrics": [{"type": "count", "id": "1"}],
+            "bucketAggs": [
+              {
+                "type": "date_histogram",
+                "field": "@timestamp",
+                "id": "2",
+                "settings": {"interval": "auto", "min_doc_count": "0"}
+              }
+            ],
+            "query": "severity:Medium",
+            "timeField": "@timestamp"
+          }
+        ],
+        "options": {
+          "reduceOptions": {"calcs": ["sum"]}
+        }
+      },
+      {
+        "type": "timeseries",
+        "title": "Alert Rate Over Time",
+        "gridPos": {"x": 0, "y": 5, "w": 16, "h": 9},
+        "datasource": {"type": "elasticsearch", "uid": "rsbp-es"},
+        "targets": [
+          {
+            "metrics": [{"type": "count", "id": "1"}],
+            "bucketAggs": [
+              {
+                "type": "date_histogram",
+                "field": "@timestamp",
+                "id": "2",
+                "settings": {"interval": "auto", "min_doc_count": "0"}
+              }
+            ],
+            "query": "*",
+            "timeField": "@timestamp"
+          }
+        ]
+      },
+      {
+        "type": "piechart",
+        "title": "Shell Categories",
+        "gridPos": {"x": 16, "y": 5, "w": 8, "h": 9},
+        "datasource": {"type": "elasticsearch", "uid": "rsbp-es"},
+        "targets": [
+          {
+            "metrics": [{"type": "count", "id": "1"}],
+            "bucketAggs": [
+              {
+                "type": "terms",
+                "field": "shell_category",
+                "id": "2",
+                "settings": {"min_doc_count": "1", "size": "10"}
+              }
+            ],
+            "query": "*",
+            "timeField": "@timestamp"
+          }
+        ]
+      },
+      {
+        "type": "barchart",
+        "title": "Top 10 Attack Patterns",
+        "gridPos": {"x": 0, "y": 14, "w": 12, "h": 9},
+        "datasource": {"type": "elasticsearch", "uid": "rsbp-es"},
+        "targets": [
+          {
+            "metrics": [{"type": "count", "id": "1"}],
+            "bucketAggs": [
+              {
+                "type": "terms",
+                "field": "pattern.keyword",
+                "id": "2",
+                "settings": {"min_doc_count": "1", "size": "10"}
+              }
+            ],
+            "query": "*",
+            "timeField": "@timestamp"
+          }
+        ]
+      },
+      {
+        "type": "logs",
+        "title": "Last 50 Alerts",
+        "gridPos": {"x": 12, "y": 14, "w": 12, "h": 9},
+        "datasource": {"type": "elasticsearch", "uid": "rsbp-es"},
+        "targets": [
+          {
+            "metrics": [{"type": "logs", "id": "1"}],
+            "query": "*",
+            "timeField": "@timestamp"
+          }
+        ]
+      }
+    ]
+  },
+  "overwrite": true
+}

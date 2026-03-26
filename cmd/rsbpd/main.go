@@ -606,6 +606,7 @@ func runDaemon(configPath string) error {
 					logger.Info("DEBUG CORRELATION CONSUMER STOPPED", zap.String("reason", "event_channel_closed"))
 					return
 				}
+				eventsProcessed.Add(1)
 				wd.NoteEvent(ev.ReceivedAt)
 				tracker.markEvent()
 				correlator.Process(ev)
@@ -627,7 +628,6 @@ func runDaemon(configPath string) error {
 		defer close(rawAlertCh)
 		for session := range correlatedSessionCh {
 			tracker.markSession()
-			eventsProcessed.Add(1)
 			ev := types.SyscallEvent{TimestampNS: uint64(time.Now().UnixNano())}
 			alerts := detector.Evaluate(session, ev, cfg.RSBP.Agent.Hostname)
 			for _, a := range alerts {

