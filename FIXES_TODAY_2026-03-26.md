@@ -69,11 +69,43 @@ This file summarizes the fixes applied today to address the **“Grafana shows n
 **Files changed**
 - Modified: `deployments/monitoring/grafana/provisioning/datasources/elasticsearch.yml`
 
+---
+
+### 4) `26b2e80` — fix detection engine correlation completion (Path B)
+
+**Commit:** `26b2e8022505a1641523e8caba0c3699d3e61695`
+
+**Message:** `fix(detection): allow RS tools on private targets`
+
+**What it fixed**
+- Fixed stacked suppression/over-filtering issues in session completion so reverse-shell tools (bash/sh/python/nc/etc.) can complete against **private RFC1918 targets** during simulation/labs.
+- Tightened completion rules to avoid bogus alerts with missing network context:
+  - `RemoteIP` must be present (not unspecified)
+  - `RemotePort` must be non-zero
+- Kept loopback suppression (don’t alert on 127.0.0.1/::1), but updated the simulation to target a private IP by default so it can actually trigger detections.
+
+**Files changed**
+- Modified: `internal/correlation/session.go`
+  - rewired `SessionState.IsComplete()` ordering and RS-tool detection
+  - skip built-in process/path whitelist checks for known RS tools
+  - for RS tools: allow private IPs but still block loopback
+- Modified: `internal/correlation/session_test.go` (new coverage for RS-tool/private/loopback + whitelist behavior)
+- Modified: `config/rsbp.yaml`
+  - `detection.score_threshold: 0.35`
+  - `detection.window_seconds: 10`
+- Modified: `test/simulate/attack_sim.sh`
+  - uses `TARGET_IP` (default `192.168.1.10`) instead of loopback
+
 ## Verification notes (what was checked)
 
 - Grafana datasource health endpoint returned healthy (Grafana API health check against the configured datasource).
 - Prometheus targets endpoint showed the rsbp scrape job and health state (via Prometheus HTTP API).
 - Grafana `/api/datasources` shows an Elasticsearch datasource with UID `rsbp-es`.
+- After Path B fixes, running the simulation produced non-zero pipeline counters (example):
+  - `alerts_emitted: 2`
+  - `detections_total: 2`
+  - `sessions_completed: 2`
+  - `suppressed_total: 0`
 
 ## Notes / gotchas
 
