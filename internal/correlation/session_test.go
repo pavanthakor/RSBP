@@ -130,7 +130,8 @@ func TestLowLevelHelpers(t *testing.T) {
 }
 
 func TestSessionIsCompleteBehavior(t *testing.T) {
-	// IsComplete should now only test behavior signals.
+	// IsComplete should classify likely reverse-shell sessions as "complete" while
+	// suppressing obvious noise from built-in whitelists.
 	incomplete := &SessionState{
 		PID:        9002,
 		ExePath:    "/bin/bash",
@@ -148,6 +149,8 @@ func TestSessionIsCompleteBehavior(t *testing.T) {
 		HasExecve:     true,
 		HasConnect:    true,
 		HasDupToStdio: true, // Complete via dup
+		RemoteIP:      net.ParseIP("8.8.8.8"),
+		RemotePort:    4444,
 	}
 	if !complete1.IsComplete() {
 		t.Fatalf("expected complete with execve, connect, and dup")
@@ -159,9 +162,58 @@ func TestSessionIsCompleteBehavior(t *testing.T) {
 		HasExecve:  true,
 		HasConnect: true,
 		HasSocket:  true, // Complete via socket
+		RemoteIP:   net.ParseIP("8.8.8.8"),
+		RemotePort: 4444,
 	}
 	if !complete2.IsComplete() {
 		t.Fatalf("expected complete with execve, connect, and socket")
+	}
+
+	// RS tools should be allowed to complete on private targets (common for simulation/labs).
+	rsPrivateNoExec := &SessionState{
+		ExePath:    "/bin/bash",
+		HasExecve:  false,
+		HasConnect: true,
+		RemoteIP:   net.ParseIP("10.0.0.7"),
+		RemotePort: 4444,
+	}
+	if !rsPrivateNoExec.IsComplete() {
+		t.Fatalf("expected RS tool to complete on private target even without execve")
+	}
+
+	// RS tools should still be suppressed for true loopback/unspecified targets.
+	rsLoopback := &SessionState{
+		ExePath:    "/bin/bash",
+		HasConnect: true,
+		RemoteIP:   net.ParseIP("127.0.0.1"),
+		RemotePort: 4444,
+	}
+	if rsLoopback.IsComplete() {
+		t.Fatalf("expected RS tool loopback session to be suppressed")
+	}
+
+	// Non-RS processes in the built-in process whitelist should not complete.
+	whitelistedProc := &SessionState{
+		ExePath:    "/usr/bin/curl",
+		HasExecve:  true,
+		HasConnect: true,
+		RemoteIP:   net.ParseIP("8.8.8.8"),
+		RemotePort: 4444,
+	}
+	if whitelistedProc.IsComplete() {
+		t.Fatalf("expected built-in whitelisted process to be suppressed")
+	}
+
+	// Non-RS processes connecting to private IPs should not complete (noise suppression).
+	privateNonTool := &SessionState{
+		ExePath:    "/usr/bin/myproc",
+		HasExecve:  true,
+		HasConnect: true,
+		RemoteIP:   net.ParseIP("192.168.1.20"),
+		RemotePort: 4444,
+	}
+	if privateNonTool.IsComplete() {
+		t.Fatalf("expected non-RS process to be suppressed on private targets")
 	}
 }
 

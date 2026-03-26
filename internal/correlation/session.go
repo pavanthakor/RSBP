@@ -150,6 +150,9 @@ var builtInPathWhitelistContains = []string{
 var builtInIgnoredCIDRs = []string{
 	"127.0.0.0/8",
 	"::1/128",
+	"10.0.0.0/8",
+	"172.16.0.0/12",
+	"192.168.0.0/16",
 	"169.254.0.0/16",
 }
 
@@ -218,7 +221,80 @@ func (s *SessionState) IsComplete() bool {
 	cat := s.CategoryDetect()
 	s.Category = cat
 
-	return s.HasExecve && s.HasConnect && (s.HasDupToStdio || s.HasSocket || cat > 0)
+	comm := strings.ToLower(strings.TrimSpace(s.ProcessName()))
+	exeBase := strings.ToLower(filepath.Base(strings.TrimSpace(s.ExePath)))
+	cmdlineLower := strings.ToLower(strings.TrimSpace(s.Cmdline))
+
+	isRSToolName := func(n string) bool {
+		switch strings.ToLower(strings.TrimSpace(n)) {
+		case "bash", "sh", "python3", "python", "nc", "netcat", "ncat", "dash":
+			return true
+		default:
+			return false
+		}
+	}
+
+	// Identify known reverse shell tools via comm, exe basename, or cmdline.
+	isRSTool := isRSToolName(comm) || isRSToolName(exeBase)
+	if !isRSTool {
+		for _, needle := range []string{"bash", "sh", "python3", "python", " netcat", " ncat", " nc ", "/dev/tcp"} {
+			if strings.Contains(cmdlineLower, needle) {
+				isRSTool = true
+				break
+			}
+		}
+	}
+
+	// For most processes, require an observed execve; known reverse shell tools may
+	// legitimately lack an execve in the correlation window (e.g. long-lived shells).
+	if !s.HasExecve && !isRSTool {
+		return false
+	}
+
+	if !s.HasConnect {
+		return false
+	}
+	if s.RemoteIP == nil || s.RemoteIP.IsUnspecified() {
+		return false
+	}
+	if s.RemotePort == 0 {
+		return false
+	}
+
+	// Only enforce public-remote constraints for non-tools; RS tools are often tested
+	// against RFC1918 targets.
+	if !isRSTool && !allowPrivateRemoteFlag.Load() && !isPublicRemoteIP(s.RemoteIP) {
+		return false
+	}
+
+	processName := s.ProcessName()
+
+	// FIXED: skip built-in process/path whitelist checks entirely for known RS tools.
+	if !isRSTool {
+		if isBuiltInWhitelistedProcessName(processName) {
+			return false
+		}
+		if isBuiltInWhitelistedPath(s.ExePath) {
+			return false
+		}
+	}
+
+	// FIXED: For RS tools, only block true loopback/unspecified; allow RFC1918 targets.
+	if isRSTool {
+		if isLoopbackIP(s.RemoteIP) {
+			return false
+		}
+	} else {
+		if isBuiltInWhitelistedIP(s.RemoteIP) {
+			return false
+		}
+	}
+
+	if isBuiltInSafePort(s.RemotePort) {
+		return false
+	}
+
+	return true
 }
 
 func (s *SessionState) ProcessName() string {
@@ -279,6 +355,13 @@ func isBuiltInWhitelistedIP(ip net.IP) bool {
 		}
 	}
 	return false
+}
+
+func isLoopbackIP(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	return ip.IsLoopback() || ip.IsUnspecified()
 }
 
 func isBuiltInSafePort(port uint16) bool {

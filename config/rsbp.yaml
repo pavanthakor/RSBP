@@ -8,10 +8,11 @@ correlation:
   cleanup_interval_seconds: 30
 detection:
   allow_private_remote: true
-  score_threshold: 0.5
+  score_threshold: 0.35
   score_threshold_critical: 0.9
   score_threshold_high: 0.7
   score_threshold_medium: 0.5
+  window_seconds: 10
   baseline_path: /var/lib/rsbp/baseline.json
 whitelist:
   paths:
