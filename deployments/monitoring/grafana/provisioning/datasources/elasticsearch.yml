@@ -5,7 +5,7 @@ datasources:
     uid: rsbp-es
     url: http://elasticsearch:9200
     access: proxy
-    isDefault: true
+    isDefault: false
     jsonData:
       index: "rsbp-alerts-*"
       timeField: "@timestamp"
