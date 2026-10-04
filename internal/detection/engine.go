@@ -137,6 +137,17 @@ func (e *Engine) Evaluate(state *correlation.SessionState, ev types.SyscallEvent
 		return nil
 	}
 
+	// Infrastructure destinations are never a reverse-shell target: loopback, the
+	// unspecified address, and link-local (169.254.0.0/16 / fe80::) — which on a
+	// cloud VM is the metadata server (e.g. GCP's 169.254.169.254, reached by
+	// agents like gce_workload_cert_refresh whose fork+pipe+dup pattern otherwise
+	// resembles a shell). Suppress these outright so the detector keys on real C2.
+	if isInfrastructureRemote(state.RemoteIP) {
+		detectionsSuppressedCounter.WithLabelValues("infrastructure_remote").Inc()
+		e.suppressedCount.Add(1)
+		return nil
+	}
+
 	baseScore := e.behaviorScore(state)
 	ruleEval := EvaluateRulesWithRules(RuleInput{
 		Session:    state,
@@ -423,6 +434,15 @@ var rsRelayTools = map[string]struct{}{
 //
 // A plain outbound connection with none of these — apt, wget, ssh, a generic
 // client — is deliberately NOT a reverse shell and does not alert.
+// isInfrastructureRemote reports whether the remote address is host/network
+// infrastructure that a reverse shell would never use as its C2 endpoint.
+func isInfrastructureRemote(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	return ip.IsLoopback() || ip.IsUnspecified() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast()
+}
+
 func hasReverseShellBehavior(s *correlation.SessionState) bool {
 	if s == nil {
 		return false
