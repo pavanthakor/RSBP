@@ -80,6 +80,12 @@ var (
 		Help:      "Distribution of detection confidence scores.",
 		Buckets:   []float64{0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0},
 	})
+	detectionLatencyHistogram = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Namespace: "rsbp",
+		Name:      "detection_latency_seconds",
+		Help:      "Time from a session's first kernel event to the alert decision.",
+		Buckets:   []float64{0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5},
+	})
 )
 
 type MetricsSnapshot struct {
@@ -116,6 +122,7 @@ func NewEngine(cfg Config, logger *zap.Logger) *Engine {
 		_ = prometheus.Register(detectionsTotalCounter)
 		_ = prometheus.Register(detectionsSuppressedCounter)
 		_ = prometheus.Register(detectionScoreHistogram)
+		_ = prometheus.Register(detectionLatencyHistogram)
 	})
 	e.buildWhitelistCaches()
 	if cfg.EnableBaseline {
@@ -246,6 +253,9 @@ func (e *Engine) Evaluate(state *correlation.SessionState, ev types.SyscallEvent
 	}
 	detectionsTotalCounter.WithLabelValues(string(scoreToSeverity(baseScore)), patternName).Inc()
 	detectionScoreHistogram.Observe(baseScore)
+	if !state.FirstEventAt.IsZero() {
+		detectionLatencyHistogram.Observe(time.Since(state.FirstEventAt).Seconds())
+	}
 	e.detectionsCount.Add(1)
 
 	alert := &types.ReverseShellAlert{

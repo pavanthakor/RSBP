@@ -1,0 +1,10 @@
+global:
+  scrape_interval: 2s        # fast refresh for a live demo
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: rsbp
+    static_configs:
+      - targets: ["127.0.0.1:9090"]   # rsbpd metrics endpoint (api.metrics_listen)
+        labels:
+          instance: rsbp-demo

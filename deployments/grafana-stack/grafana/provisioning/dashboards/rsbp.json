@@ -1,0 +1,116 @@
+{
+  "uid": "rsbp-main",
+  "title": "RSBP — Catching Shells at the Kernel",
+  "tags": ["rsbp", "ebpf", "security"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "editable": true,
+  "style": "dark",
+  "refresh": "2s",
+  "time": { "from": "now-15m", "to": "now" },
+  "templating": { "list": [] },
+  "annotations": { "list": [] },
+  "panels": [
+    {
+      "id": 1, "type": "stat", "title": "eBPF probes attached",
+      "datasource": { "type": "prometheus", "uid": "rsbp-prom" },
+      "gridPos": { "h": 4, "w": 5, "x": 0, "y": 0 },
+      "options": { "colorMode": "value", "graphMode": "none", "textMode": "value", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "green", "value": 11 } ] }, "unit": "short" } },
+      "targets": [ { "refId": "A", "expr": "rsbp_ebpf_probe_count", "datasource": { "type": "prometheus", "uid": "rsbp-prom" } } ]
+    },
+    {
+      "id": 2, "type": "stat", "title": "Kernel events / sec",
+      "datasource": { "type": "prometheus", "uid": "rsbp-prom" },
+      "gridPos": { "h": 4, "w": 5, "x": 5, "y": 0 },
+      "options": { "colorMode": "value", "graphMode": "area", "textMode": "value", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "#2fc7b8" }, "unit": "ops" } },
+      "targets": [ { "refId": "A", "expr": "rsbp_events_per_second", "datasource": { "type": "prometheus", "uid": "rsbp-prom" } } ]
+    },
+    {
+      "id": 3, "type": "stat", "title": "Reverse shells detected",
+      "datasource": { "type": "prometheus", "uid": "rsbp-prom" },
+      "gridPos": { "h": 4, "w": 5, "x": 10, "y": 0 },
+      "options": { "colorMode": "background", "graphMode": "none", "textMode": "value", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] }, "unit": "short" } },
+      "targets": [ { "refId": "A", "expr": "sum(rsbp_detections_total)", "datasource": { "type": "prometheus", "uid": "rsbp-prom" } } ]
+    },
+    {
+      "id": 4, "type": "stat", "title": "False positives avoided (suppressed)",
+      "datasource": { "type": "prometheus", "uid": "rsbp-prom" },
+      "gridPos": { "h": 4, "w": 5, "x": 15, "y": 0 },
+      "options": { "colorMode": "value", "graphMode": "none", "textMode": "value", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "#45c884" }, "unit": "short" } },
+      "targets": [ { "refId": "A", "expr": "sum(rsbp_detections_suppressed_total)", "datasource": { "type": "prometheus", "uid": "rsbp-prom" } } ]
+    },
+    {
+      "id": 5, "type": "stat", "title": "Active sessions",
+      "datasource": { "type": "prometheus", "uid": "rsbp-prom" },
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 0 },
+      "options": { "colorMode": "value", "graphMode": "area", "textMode": "value", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "#7aa2c8" }, "unit": "short" } },
+      "targets": [ { "refId": "A", "expr": "rsbp_sessions_active", "datasource": { "type": "prometheus", "uid": "rsbp-prom" } } ]
+    },
+
+    {
+      "id": 6, "type": "timeseries", "title": "Kernel event rate by syscall",
+      "description": "What the kernel sees, per second, grouped by the syscall tracepoint.",
+      "datasource": { "type": "prometheus", "uid": "rsbp-prom" },
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 4 },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 18, "stacking": { "mode": "normal" }, "showPoints": "never" } } },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [ { "refId": "A", "expr": "sum by (syscall_type) (rate(rsbp_events_total[1m]))", "legendFormat": "{{syscall_type}}", "datasource": { "type": "prometheus", "uid": "rsbp-prom" } } ]
+    },
+    {
+      "id": 7, "type": "timeseries", "title": "Detections vs suppressed",
+      "description": "Behaviour-gated: suppressed are events that connected out but showed no reverse-shell behaviour.",
+      "datasource": { "type": "prometheus", "uid": "rsbp-prom" },
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 4 },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 12, "showPoints": "never" } },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "detections" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "#ff5a65" } } ] },
+          { "matcher": { "id": "byName", "options": "suppressed" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "#45c884" } } ] }
+        ] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(rsbp_detections_total[1m]))", "legendFormat": "detections", "datasource": { "type": "prometheus", "uid": "rsbp-prom" } },
+        { "refId": "B", "expr": "sum(rate(rsbp_detections_suppressed_total[1m]))", "legendFormat": "suppressed", "datasource": { "type": "prometheus", "uid": "rsbp-prom" } }
+      ]
+    },
+
+    {
+      "id": 8, "type": "timeseries", "title": "Detection latency (first kernel event → alert)",
+      "description": "Time to detect, from the session's first syscall to the alert decision.",
+      "datasource": { "type": "prometheus", "uid": "rsbp-prom" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 13 },
+      "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "auto" } } },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "refId": "A", "expr": "histogram_quantile(0.5, sum(rate(rsbp_detection_latency_seconds_bucket[5m])) by (le))", "legendFormat": "p50", "datasource": { "type": "prometheus", "uid": "rsbp-prom" } },
+        { "refId": "B", "expr": "histogram_quantile(0.95, sum(rate(rsbp_detection_latency_seconds_bucket[5m])) by (le))", "legendFormat": "p95", "datasource": { "type": "prometheus", "uid": "rsbp-prom" } }
+      ]
+    },
+    {
+      "id": 9, "type": "piechart", "title": "Detections by severity",
+      "datasource": { "type": "prometheus", "uid": "rsbp-prom" },
+      "gridPos": { "h": 8, "w": 7, "x": 12, "y": 13 },
+      "options": { "legend": { "displayMode": "list", "placement": "right" }, "reduceOptions": { "calcs": ["lastNotNull"] }, "pieType": "donut" },
+      "fieldConfig": { "defaults": { "unit": "short" },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "Critical" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "#ff5a65" } } ] },
+          { "matcher": { "id": "byName", "options": "High" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "#ff9440" } } ] },
+          { "matcher": { "id": "byName", "options": "Medium" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "#ecc748" } } ] }
+        ] },
+      "targets": [ { "refId": "A", "expr": "sum by (severity) (rsbp_detections_total)", "legendFormat": "{{severity}}", "datasource": { "type": "prometheus", "uid": "rsbp-prom" } } ]
+    },
+    {
+      "id": 10, "type": "stat", "title": "Ring-buffer events lost",
+      "description": "0 means the userspace collector kept up with the kernel.",
+      "datasource": { "type": "prometheus", "uid": "rsbp-prom" },
+      "gridPos": { "h": 8, "w": 5, "x": 19, "y": 13 },
+      "options": { "colorMode": "value", "graphMode": "area", "textMode": "value", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] }, "unit": "short" } },
+      "targets": [ { "refId": "A", "expr": "rsbp_ring_buffer_lost_total + rsbp_ebpf_drops_total", "datasource": { "type": "prometheus", "uid": "rsbp-prom" } } ]
+    }
+  ]
+}
