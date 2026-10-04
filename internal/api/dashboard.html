@@ -139,10 +139,17 @@
 const $=id=>document.getElementById(id);
 const fmt=n=>n==null?"—":Number(n).toLocaleString();
 const esc=s=>String(s==null?"":s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-let lastTop=null,prevEv=null,prevT=null;
+let lastTop=null,prevEv=null,prevT=null,failCount=0;
 
 // syscalls that are the behavioural discriminator get the "key" treatment + annotation
 const KEY={dup2:"socket → stdio",dup3:"socket → stdio",fork_pipe:"fork + pipe relay"};
+// launcher wrappers whose name should not be shown as the offending process
+const WRAP={timeout:1,sudo:1,env:1,nohup:1,setsid:1,time:1,stdbuf:1,unbuffer:1};
+function procName(pr){
+  let c=(pr.comm||"").toLowerCase();
+  if(!c||WRAP[c]){ const b=(pr.exe_path||"").split("/").pop(); if(b) return b; }
+  return pr.comm||pr.exe_path||"?";
+}
 function chainHTML(chain,sev){
   if(!chain||!chain.length) return "";
   const parts=[];
@@ -191,7 +198,7 @@ async function tick(){
         const pr=a.process||{},nw=a.network||{},sev=a.severity||"Low";
         const t=a.timestamp?new Date(a.timestamp):null;
         const hhmm=t?t.toTimeString().slice(0,8):"";
-        const who=esc(pr.comm||pr.exe_path||"?");
+        const who=esc(procName(pr));
         const pid=pr.pid?'<span class="pid"> · pid '+pr.pid+'</span>':'';
         const pat=a.pattern&&a.pattern!=="unknown"?'<span class="pat">pattern <b>'+esc(a.pattern)+'</b></span>':'<span class="pat"></span>';
         const sc=a.score!=null?Number(a.score).toFixed(2):"";
@@ -208,8 +215,8 @@ async function tick(){
       if(topId&&topId!==lastTop&&lastTop!==null) stream.firstElementChild.classList.add("flash");
       lastTop=topId;
     }
-    setLive(true);
-  }catch(_){ setLive(false); }
+    failCount=0; setLive(true);
+  }catch(_){ failCount++; if(failCount>=3) setLive(false); }
   $("f_clock").textContent=new Date().toTimeString().slice(0,8);
 }
 function setLive(ok){

