@@ -14,8 +14,8 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/yoursec/rsbp/internal/correlation"
-	"github.com/yoursec/rsbp/internal/types"
+	"github.com/pavanthakor/RSBP/internal/correlation"
+	"github.com/pavanthakor/RSBP/internal/types"
 )
 
 type Result struct {
@@ -47,6 +47,10 @@ type Config struct {
 	AbuseCachePath    string `mapstructure:"abuseipdb_cache_path"`
 	AbuseIPDBEnabled  bool   `mapstructure:"abuseipdb_enabled"`
 	ProcRoot          string `mapstructure:"proc_root"`
+	// Offline hard-disables every enrichment step that would touch the network
+	// (GeoIP online fallback, reputation lookups, reverse DNS). Local /proc
+	// collection still runs. Set this for the offline conference demo.
+	Offline bool `mapstructure:"offline"`
 }
 
 type Enricher struct {
@@ -55,6 +59,7 @@ type Enricher struct {
 	procInfo   *ProcEnricher
 	cache      *ttlcache.Cache[string, *Result]
 	logger     *zap.Logger
+	offline    bool
 }
 
 var (
@@ -100,6 +105,7 @@ func NewEnricher(cfg Config, logger *zap.Logger) *Enricher {
 		procInfo:   NewProcEnricher(cfg.ProcRoot, logger),
 		cache:      cache,
 		logger:     logger,
+		offline:    cfg.Offline,
 	}
 }
 
@@ -134,7 +140,7 @@ func (e *Enricher) Enrich(ctx context.Context, s *correlation.SessionState) (*Re
 	}
 
 	g, gctx := errgroup.WithContext(ctx)
-	if res.Country == "" && s.RemoteIP != nil {
+	if res.Country == "" && s.RemoteIP != nil && !e.offline {
 		g.Go(func() error {
 			lookup, err := e.geo.Lookup(gctx, s.RemoteIP)
 			if err != nil {
@@ -196,7 +202,7 @@ func (e *Enricher) Enrich(ctx context.Context, s *correlation.SessionState) (*Re
 		res.NetworkConnections = append([]NetConn(nil), procRes.NetworkConnections...)
 	}
 
-	if s.RemoteIP != nil {
+	if s.RemoteIP != nil && !e.offline {
 		hostCtx, hostCancel := context.WithTimeout(ctx, 150*time.Millisecond)
 		defer hostCancel()
 		res.RemoteHostname = reverseDNS(hostCtx, s.RemoteIP)

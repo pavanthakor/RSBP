@@ -1,0 +1,77 @@
+# RSBP — conference demo config.
+# Self-contained and offline: JSONL only, no Elasticsearch, no enrichment network
+# calls, quiet logs. Use this for the live c0c0n demo. config/rsbp.yaml remains
+# the full-stack reference.
+agent:
+  log_level: warn            # quiet: per-event Info spam is off; warnings/errors still show
+  max_events_per_sec: 10000
+ebpf:
+  ring_buffer_size: 8388608
+correlation:
+  window_seconds: 5
+  cleanup_interval_seconds: 30
+detection:
+  allow_private_remote: true # lab targets are RFC1918 / TEST-NET on a dummy interface
+  score_threshold: 0.35
+  score_threshold_critical: 0.9
+  score_threshold_high: 0.7
+  score_threshold_medium: 0.5
+  window_seconds: 10
+  baseline_path: /var/lib/rsbp/baseline.json
+whitelist:
+  paths:
+  - /usr/bin/node*
+  - /usr/local/bin/node*
+  - /usr/bin/curl
+  - /usr/bin/wget
+  - /usr/bin/docker
+  - /usr/bin/code*
+  - /usr/lib/vscode*
+  - /snap/bin/*
+  ips:
+  - 10.0.0.0/8
+  - 172.16.0.0/12
+  - 192.168.0.0/16
+  users: []
+  process_names:
+  - node
+  - curl
+  - wget
+  - docker
+  - dockerd
+  - code
+  - filebeat
+  - elasticsearch
+  - grafana
+  - rsbpd
+  - bpftool
+enrichment:
+  geoip_db_path: ''          # empty + demo mode => no ipapi.co fallback (offline)
+  abuseipdb_api_key: ''
+  timeout_seconds: 2
+  offline: true              # hard-disable all outbound enrichment calls for the demo
+forensics:
+  enabled: false
+  pcap_duration_seconds: 10
+  pcap_max_bytes: 1048576
+output:
+  jsonl:
+    enabled: true
+    path: /var/log/rsbp/alerts.jsonl
+  elasticsearch:
+    enabled: false           # the big one: no ES sink => no 100s+ stall, no dropped alerts
+    addresses:
+    - http://localhost:9200
+    tls_ca_cert: ''
+  splunk:
+    enabled: false
+  kafka:
+    enabled: false
+  syslog:
+    enabled: false
+  webhook:
+    enabled: false
+api:
+  listen_addr: 127.0.0.1:9001
+  metrics_listen: 127.0.0.1:9090
+  enabled: true

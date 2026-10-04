@@ -500,11 +500,16 @@ func validateParentDirExists(field string, filePath string) error {
 	if parent == "." || parent == "" {
 		return fmt.Errorf("%s has invalid path: %s", field, filePath)
 	}
-	st, err := os.Stat(parent)
-	if err != nil {
-		return fmt.Errorf("%s parent directory does not exist: %s", field, parent)
-	}
-	if !st.IsDir() {
+	// Self-heal: create the runtime directory if it does not yet exist, so the
+	// daemon starts on a fresh machine without a wrapper script having to
+	// pre-create /var/log/rsbp and /var/lib/rsbp. Only a genuine failure
+	// (e.g. permission denied) aborts startup.
+	if st, err := os.Stat(parent); err != nil {
+		if mkErr := os.MkdirAll(parent, 0o755); mkErr != nil {
+			return fmt.Errorf("%s parent directory does not exist and could not be created: %s (%v)", field, parent, mkErr)
+		}
+		return nil
+	} else if !st.IsDir() {
 		return fmt.Errorf("%s parent is not a directory: %s", field, parent)
 	}
 	return nil

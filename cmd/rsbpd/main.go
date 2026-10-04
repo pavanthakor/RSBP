@@ -26,17 +26,17 @@ import (
 	"github.com/spf13/cobra"
 	"go.uber.org/zap"
 
-	"github.com/yoursec/rsbp/internal/alert"
-	"github.com/yoursec/rsbp/internal/api"
-	"github.com/yoursec/rsbp/internal/correlation"
-	"github.com/yoursec/rsbp/internal/detection"
-	"github.com/yoursec/rsbp/internal/ebpf"
-	"github.com/yoursec/rsbp/internal/enrichment"
-	"github.com/yoursec/rsbp/internal/forensics"
-	plog "github.com/yoursec/rsbp/internal/logging"
-	"github.com/yoursec/rsbp/internal/output"
-	"github.com/yoursec/rsbp/internal/types"
-	"github.com/yoursec/rsbp/internal/watchdog"
+	"github.com/pavanthakor/RSBP/internal/alert"
+	"github.com/pavanthakor/RSBP/internal/api"
+	"github.com/pavanthakor/RSBP/internal/correlation"
+	"github.com/pavanthakor/RSBP/internal/detection"
+	"github.com/pavanthakor/RSBP/internal/ebpf"
+	"github.com/pavanthakor/RSBP/internal/enrichment"
+	"github.com/pavanthakor/RSBP/internal/forensics"
+	plog "github.com/pavanthakor/RSBP/internal/logging"
+	"github.com/pavanthakor/RSBP/internal/output"
+	"github.com/pavanthakor/RSBP/internal/types"
+	"github.com/pavanthakor/RSBP/internal/watchdog"
 )
 
 var (
@@ -86,6 +86,7 @@ type appConfig struct {
 			AbuseIPDBCache  string `mapstructure:"abuseipdb_cache"`
 			AbuseIPDBAPIKey string `mapstructure:"abuseipdb_api_key"`
 			TimeoutSeconds  int    `mapstructure:"timeout_seconds"`
+			Offline         bool   `mapstructure:"offline"`
 		} `mapstructure:"enrichment"`
 		Forensics struct {
 			Enabled          bool   `mapstructure:"enabled"`
@@ -286,8 +287,17 @@ func validateStartupPrerequisites(cfg *appConfig, logger *zap.Logger) error {
 	if _, err := os.Stat("/sys/kernel/btf/vmlinux"); err != nil {
 		issues = append(issues, "missing BTF support file: /sys/kernel/btf/vmlinux")
 	}
-	if st, err := os.Stat("/sys/kernel/debug/tracing"); err != nil || !st.IsDir() {
-		issues = append(issues, "tracepoints path unavailable: /sys/kernel/debug/tracing")
+	// Accept either the modern tracefs mount (/sys/kernel/tracing) or the legacy
+	// debugfs location (/sys/kernel/debug/tracing); a standard Ubuntu kernel has one of them.
+	tracingOK := false
+	for _, p := range []string{"/sys/kernel/tracing/events/syscalls", "/sys/kernel/debug/tracing/events/syscalls"} {
+		if st, err := os.Stat(p); err == nil && st.IsDir() {
+			tracingOK = true
+			break
+		}
+	}
+	if !tracingOK {
+		issues = append(issues, "tracepoints path unavailable: mount tracefs (sudo mount -t tracefs none /sys/kernel/tracing) — see scripts/setup-demo.sh")
 	}
 
 	for _, dir := range []string{"/var/log/rsbp", "/var/lib/rsbp"} {
@@ -506,6 +516,7 @@ func runDaemon(configPath string) error {
 	ebpfLoader.ProbeHealthCheck(rootCtx)
 
 	correlator := correlation.New(time.Duration(cfg.RSBP.Detection.WindowSeconds)*time.Second, correlatedSessionCh, logger)
+	correlator.StartMaintenance(rootCtx)
 	correlation.SetAllowPrivateRemote(cfg.RSBP.Detection.AllowPrivateRemote)
 	detector := detection.NewEngine(detection.Config{
 		ExecConnectWindowSeconds: cfg.RSBP.Detection.WindowSeconds,
@@ -525,6 +536,7 @@ func runDaemon(configPath string) error {
 		AbuseCachePath:   cfg.RSBP.Enrichment.AbuseIPDBCache,
 		AbuseIPDBAPIKey:  cfg.RSBP.Enrichment.AbuseIPDBAPIKey,
 		AbuseIPDBEnabled: cfg.RSBP.Enrichment.AbuseIPDBAPIKey != "",
+		Offline:          cfg.RSBP.Enrichment.Offline,
 	}, logger)
 	collector := forensics.NewCollector(forensics.Config{
 		ArtifactDir:    cfg.RSBP.Forensics.OutputDir,
