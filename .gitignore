@@ -9,7 +9,7 @@ Thumbs.db
 
 # --- Build artifacts ---
 bin/
-rsbpd
+/rsbpd
 *.exe
 *.dll
 *.so

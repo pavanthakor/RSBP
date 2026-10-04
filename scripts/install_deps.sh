@@ -11,7 +11,7 @@ export DEBIAN_FRONTEND=noninteractive
 
 apt-get update
 apt-get install -y --no-install-recommends \
-  clang-15 \
+  clang \
   libbpf-dev \
   "linux-headers-$(uname -r)" \
   bpftool \

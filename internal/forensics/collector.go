@@ -25,8 +25,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 
-	"github.com/yoursec/rsbp/internal/enrichment"
-	"github.com/yoursec/rsbp/internal/types"
+	"github.com/pavanthakor/RSBP/internal/enrichment"
+	"github.com/pavanthakor/RSBP/internal/types"
 )
 
 type ForensicBundle struct {

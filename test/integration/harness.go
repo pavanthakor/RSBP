@@ -7,11 +7,11 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/yoursec/rsbp/internal/alert"
-	"github.com/yoursec/rsbp/internal/correlation"
-	"github.com/yoursec/rsbp/internal/detection"
-	"github.com/yoursec/rsbp/internal/enrichment"
-	"github.com/yoursec/rsbp/internal/types"
+	"github.com/pavanthakor/RSBP/internal/alert"
+	"github.com/pavanthakor/RSBP/internal/correlation"
+	"github.com/pavanthakor/RSBP/internal/detection"
+	"github.com/pavanthakor/RSBP/internal/enrichment"
+	"github.com/pavanthakor/RSBP/internal/types"
 )
 
 type EventInjector struct {

@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yoursec/rsbp/internal/correlation"
-	"github.com/yoursec/rsbp/internal/types"
+	"github.com/pavanthakor/RSBP/internal/correlation"
+	"github.com/pavanthakor/RSBP/internal/types"
 )
 
 func TestEndToEndScenarios(t *testing.T) {
