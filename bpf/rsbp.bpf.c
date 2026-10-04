@@ -109,6 +109,7 @@ static __always_inline void fill_common(struct syscall_event *evt, __u32 syscall
     evt->syscall_nr = syscall_nr;
     evt->fd = fd;
     evt->timestamp_ns = bpf_ktime_get_ns();
+    evt->start_time = BPF_CORE_READ(task, start_time);
     bpf_get_current_comm(evt->comm, sizeof(evt->comm));
 }
 

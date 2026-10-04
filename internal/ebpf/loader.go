@@ -24,7 +24,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 
-	"github.com/yoursec/rsbp/internal/types"
+	"github.com/pavanthakor/RSBP/internal/types"
 )
 
 type Stats struct {
@@ -262,6 +262,7 @@ type rawSyscallEvent struct {
 	RemotePort     uint16
 	Family         uint16
 	TimestampNS    uint64
+	StartTimeNS    uint64
 	Comm           [16]byte
 	ExecPath       [256]byte
 	Args           [512]byte
@@ -459,6 +460,7 @@ func (l *Loader) Run(ctx context.Context, events chan<- types.SyscallEvent) erro
 				RemotePort:     raw.RemotePort,
 				Family:         raw.Family,
 				TimestampNS:    toUnixTimestampNS(l.bootTime, raw.TimestampNS),
+				StartTimeNS:    raw.StartTimeNS,
 				Comm:           raw.Comm,
 				ExecPath:       raw.ExecPath,
 				Args:           raw.Args,
@@ -654,31 +656,29 @@ func (l *Loader) ProbeHealthCheck(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				count, err := l.countAttachedProgramsViaBPFTool()
-				if err != nil {
-					l.logger.Warn("probe health check failed", zap.Error(err))
-					l.linksMu.RLock()
-					fallback := len(l.links)
-					l.linksMu.RUnlock()
-					probeCountGauge.Set(float64(fallback))
+				// The link handles we hold are the authoritative count of attached
+				// tracepoints — bpftool is unreliable here (it truncates program
+				// names to 15 chars, collapsing trace_enter_dup2/dup3 and
+				// pipe/pipe2, so 11 programs read as 9 and the old code re-attached
+				// every tick). bpftool is only used for an optional informational
+				// gauge when present.
+				l.linksMu.RLock()
+				attached := len(l.links)
+				l.linksMu.RUnlock()
+				probeCountGauge.Set(float64(attached))
+
+				if attached >= expectedProbeCount {
 					continue
 				}
 
-				probeCountGauge.Set(float64(count))
-				if count >= expectedProbeCount {
-					continue
-				}
-
-				l.logger.Error("CRITICAL: eBPF probe count dropped below expected threshold; attempting re-attach",
-					zap.Int("observed_probe_count", count),
-					zap.Int("expected_probe_count", expectedProbeCount),
+				l.logger.Error("eBPF probe count below expected; attempting re-attach",
+					zap.Int("attached", attached),
+					zap.Int("expected", expectedProbeCount),
 				)
-
 				if err := l.reattachProbes(); err != nil {
 					l.logger.Error("probe re-attach attempt failed", zap.Error(err))
 					continue
 				}
-
 				l.linksMu.RLock()
 				reattached := len(l.links)
 				l.linksMu.RUnlock()

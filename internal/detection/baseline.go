@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yoursec/rsbp/internal/correlation"
+	"github.com/pavanthakor/RSBP/internal/correlation"
 )
 
 type BaselineModel struct {

@@ -13,7 +13,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 
-	"github.com/yoursec/rsbp/internal/types"
+	"github.com/pavanthakor/RSBP/internal/types"
 )
 
 const (
@@ -155,18 +155,11 @@ func (e *Engine) Process(event types.SyscallEvent) {
 			session.Cmdline = args
 		}
 
-		if inherited, ok := e.parentSocketMap.Load(session.PPID); ok {
-			p := inherited.(parentSocketState)
-			if !session.HasSocket && p.SocketFD >= 0 {
-				session.SocketFD = p.SocketFD
-				session.HasSocket = true
-			}
-			if !session.HasConnect && p.RemoteIP != nil && p.RemotePort != 0 {
-				session.RemoteIP = append(net.IP(nil), p.RemoteIP...)
-				session.RemotePort = p.RemotePort
-				session.HasConnect = true
-			}
-		}
+		// NOTE: cross-process socket/connect inheritance was removed. The strict
+		// behavioural detector identifies the reverse-shell process by its OWN
+		// syscalls (execve+socket+connect+dup2, /dev/tcp, or a relay tool). Letting
+		// a child inherit a parent's — or a sibling's — socket state produced false
+		// positives (e.g. a netcat listener inheriting an earlier client's connect).
 
 	case sysSocket:
 		session.HasSocket = true
@@ -186,35 +179,8 @@ func (e *Engine) Process(event types.SyscallEvent) {
 		if event.RemotePort != 0 {
 			session.RemotePort = event.RemotePort
 		}
-		e.parentSocketMap.Store(pid, parentSocketState{
-			SocketFD:   session.SocketFD,
-			RemoteIP:   append(net.IP(nil), session.RemoteIP...),
-			RemotePort: session.RemotePort,
-			UpdatedAt:  now,
-		})
-
-		if parentAny, ok := e.sessions.Load(session.PPID); ok {
-			if parent, ok := parentAny.(*SessionState); ok && parent != nil {
-				parent.HasConnect = true
-				if parent.SocketFD < 0 && session.SocketFD >= 0 {
-					parent.SocketFD = session.SocketFD
-				}
-				if session.RemoteIP != nil {
-					parent.RemoteIP = append(net.IP(nil), session.RemoteIP...)
-				}
-				if session.RemotePort != 0 {
-					parent.RemotePort = session.RemotePort
-				}
-				parent.LastUpdate = now
-				e.sessions.Store(parent.PID, parent)
-				e.parentSocketMap.Store(parent.PID, parentSocketState{
-					SocketFD:   parent.SocketFD,
-					RemoteIP:   append(net.IP(nil), parent.RemoteIP...),
-					RemotePort: parent.RemotePort,
-					UpdatedAt:  now,
-				})
-			}
-		}
+		// Connect/socket state stays on the process that performed it; it is no
+		// longer propagated to the parent or to sibling processes (see note above).
 
 	case sysDup2, sysDup3:
 		if event.HasDup2Stdio != 0 {
@@ -363,7 +329,11 @@ func (e *Engine) cleanup() {
 			return true
 		}
 
-		if session.LastUpdate.Before(cutoff) && !session.IsComplete() {
+		// Reap by age regardless of completion status. A session older than the
+		// cutoff is finished with — keeping a "complete" one around only lets a
+		// later process that recycles its PID inherit its stale socket/connect
+		// state and raise a false positive (observed as a ghost netcat alert).
+		if session.LastUpdate.Before(cutoff) {
 			e.sessions.Delete(pid)
 			e.parentSocketMap.Delete(pid)
 			e.forkSeen.Delete(pid)
@@ -401,6 +371,28 @@ func emittedSessionKey(session *SessionState) string {
 		pattern = fmt.Sprintf("cat-%d", session.CategoryDetect())
 	}
 	return fmt.Sprintf("%d|%s|%s", session.PID, remoteIP, pattern)
+}
+
+// StartMaintenance runs the periodic session-cleanup loop on its own goroutine.
+// The live daemon feeds events via Process() directly (not Run), so without this
+// the cleanup ticker never fires and the sessions map grows without bound. Call
+// once at startup with the daemon's root context.
+func (e *Engine) StartMaintenance(ctx context.Context) {
+	if e == nil {
+		return
+	}
+	go func() {
+		ticker := time.NewTicker(e.windowDuration)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				e.cleanup()
+			}
+		}
+	}()
 }
 
 func (e *Engine) Run(ctx context.Context, events <-chan types.SyscallEvent) {
@@ -445,7 +437,18 @@ func (e *Engine) Run(ctx context.Context, events <-chan types.SyscallEvent) {
 func (e *Engine) getOrCreateSession(event types.SyscallEvent, now time.Time) *SessionState {
 	if existing, ok := e.sessions.Load(event.PID); ok {
 		if s, castOK := existing.(*SessionState); castOK {
-			return s
+			// PID-reuse guard: if the kernel reports a different process start time
+			// for this PID, the previous process has exited and the PID has been
+			// recycled by an unrelated process. Discard the stale session so its
+			// socket/connect state cannot be inherited (which otherwise produces a
+			// false positive, e.g. a listener that reuses a client's PID).
+			if event.StartTimeNS != 0 && s.StartTimeNS != 0 && event.StartTimeNS != s.StartTimeNS {
+				e.parentSocketMap.Delete(event.PID)
+				e.forkSeen.Delete(event.PID)
+				e.pipeSeen.Delete(event.PID)
+			} else {
+				return s
+			}
 		}
 	}
 
@@ -457,6 +460,7 @@ func (e *Engine) getOrCreateSession(event types.SyscallEvent, now time.Time) *Se
 		SocketFD:    -1,
 		StartTime:   now,
 		LastUpdate:  now,
+		StartTimeNS: event.StartTimeNS,
 		ProcessTree: make([]ProcessNode, 0, 4),
 	}
 	e.sessions.Store(event.PID, s)

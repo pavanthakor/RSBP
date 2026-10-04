@@ -7,9 +7,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/yoursec/rsbp/internal/correlation"
-	"github.com/yoursec/rsbp/internal/enrichment"
-	"github.com/yoursec/rsbp/internal/types"
+	"github.com/pavanthakor/RSBP/internal/correlation"
+	"github.com/pavanthakor/RSBP/internal/enrichment"
+	"github.com/pavanthakor/RSBP/internal/types"
 )
 
 type RuleInput struct {
@@ -199,6 +199,10 @@ var (
 )
 
 func DefaultRules() []Rule {
+	// UnusualTimeRule is intentionally excluded: it made the final score depend on
+	// the wall-clock hour (02:00–05:59 UTC), so the same action scored differently
+	// at a morning rehearsal vs an afternoon talk. Scoring is now time-independent.
+	// The rule remains defined and can be re-enabled by a deployment that wants it.
 	return []Rule{
 		externalIPRule,
 		c2PortRule,
@@ -206,7 +210,6 @@ func DefaultRules() []Rule {
 		correlatedBehaviorRule,
 		lowFPCombinedRule,
 		ephemeralPortRule,
-		unusualTimeRule,
 		threatIntelRule,
 	}
 }

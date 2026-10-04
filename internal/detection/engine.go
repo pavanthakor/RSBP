@@ -16,8 +16,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 
-	"github.com/yoursec/rsbp/internal/correlation"
-	"github.com/yoursec/rsbp/internal/types"
+	"github.com/pavanthakor/RSBP/internal/correlation"
+	"github.com/pavanthakor/RSBP/internal/types"
 )
 
 const (
@@ -146,6 +146,29 @@ func (e *Engine) Evaluate(state *correlation.SessionState, ev types.SyscallEvent
 	if ruleEval.Score > baseScore {
 		baseScore = ruleEval.Score
 	}
+
+	// STRICT BEHAVIOURAL GATE (#1 / #3): an alert requires an actual reverse-shell
+	// *behaviour*, not merely an outbound connection to an external/C2 endpoint.
+	// Destination signals (external IP, C2 port, ephemeral port, odd hour) only
+	// modulate severity once a behavioural core is present. This is what keeps
+	// apt/wget/ssh/dpkg quiet, and it also removes the per-child duplicate alerts:
+	// helper processes (groups, lesspipe, dircolors, the shell's own children)
+	// inherit the socket but never perform the dup2 themselves, so they have no
+	// core signal and are not alerted. The process that actually duplicated the
+	// socket onto stdio is the one that fires.
+	if !hasReverseShellBehavior(state) {
+		detectionsSuppressedCounter.WithLabelValues("no_reverse_shell_behavior").Inc()
+		e.suppressedCount.Add(1)
+		e.baseline.Observe(state, baseScore, false)
+		e.logger.Debug("SUPPRESSED no reverse-shell behaviour",
+			zap.Uint32("pid", state.PID),
+			zap.String("exe", state.ExePath),
+			zap.String("remote_ip", state.RemoteIP.String()),
+			zap.String("pipeline_stage", "detection"),
+		)
+		return nil
+	}
+
 	e.logger.Info("DETECTION DECISION",
 		zap.Uint32("pid", state.PID),
 		zap.String("exe", state.ExePath),
@@ -169,6 +192,7 @@ func (e *Engine) Evaluate(state *correlation.SessionState, ev types.SyscallEvent
 		"nc":      true,
 		"netcat":  true,
 		"ncat":    true,
+		"socat":   true,
 		"dash":    true,
 	}
 
@@ -230,6 +254,7 @@ func (e *Engine) Evaluate(state *correlation.SessionState, ev types.SyscallEvent
 			"window_sec":  fmt.Sprintf("%d", e.cfg.ExecConnectWindowSeconds),
 			"category":    fmt.Sprintf("%d", state.Category),
 			"fired_rules": strings.Join(ruleEval.FiredRules, ","),
+			"pattern":     patternName,
 		},
 		PipelineStart: state.FirstEventAt,
 		Process: types.ProcessContext{
@@ -377,6 +402,55 @@ func primaryRuleID(fired []string) string {
 		return "RSBP-REV-SHELL-001"
 	}
 	return fired[0]
+}
+
+// rsRelayTools are network-capable shell/relay binaries whose sole purpose, when
+// making an outbound connection, is overwhelmingly to relay a shell. Matched by
+// exact comm/exe basename (not substring) to avoid catching "sync", "vnc", etc.
+var rsRelayTools = map[string]struct{}{
+	"nc": {}, "ncat": {}, "netcat": {}, "nc.openbsd": {},
+	"nc.traditional": {}, "ncat.traditional": {}, "socat": {},
+}
+
+// hasReverseShellBehavior reports whether the session exhibits a core reverse-shell
+// *behaviour*, independent of the remote address. This is the behavioural-profiling
+// discriminator the talk is built on. Any one of the following qualifies:
+//   - a socket duplicated onto stdin/stdout/stderr (dup2/dup3 to std fds)
+//   - a bash /dev/tcp redirection in the command line
+//   - a fork+pipe interactive relay
+//   - an nc/ncat/netcat/socat process making an outbound connection
+//   - a match against a known behavioural pattern (patterns.go)
+//
+// A plain outbound connection with none of these — apt, wget, ssh, a generic
+// client — is deliberately NOT a reverse shell and does not alert.
+func hasReverseShellBehavior(s *correlation.SessionState) bool {
+	if s == nil {
+		return false
+	}
+	if s.HasDupToStdio {
+		return true
+	}
+	cmd := strings.ToLower(s.Cmdline)
+	if strings.Contains(cmd, "/dev/tcp") || strings.Contains(cmd, "/dev/udp") {
+		return true
+	}
+	if s.HasForkWithPipe {
+		return true
+	}
+	if s.HasConnect {
+		name := strings.ToLower(strings.TrimSpace(processNameFromSession(s)))
+		exe := strings.ToLower(filepath.Base(strings.TrimSpace(s.ExePath)))
+		if _, ok := rsRelayTools[name]; ok {
+			return true
+		}
+		if _, ok := rsRelayTools[exe]; ok {
+			return true
+		}
+	}
+	if p := correlation.BestMatchPattern(s); p != nil {
+		return true
+	}
+	return false
 }
 
 func (e *Engine) behaviorScore(state *correlation.SessionState) float64 {
@@ -543,7 +617,7 @@ func (e *Engine) isWhitelisted(state *correlation.SessionState) (bool, string) {
 
 	neverSuppress := map[string]bool{
 		"bash": true, "sh": true, "python3": true, "python": true,
-		"nc": true, "netcat": true, "ncat": true, "dash": true,
+		"nc": true, "netcat": true, "ncat": true, "socat": true, "dash": true,
 	}
 	if neverSuppress[strings.ToLower(strings.TrimSpace(procName))] {
 		return false, ""

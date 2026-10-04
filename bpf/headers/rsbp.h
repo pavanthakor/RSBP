@@ -11,6 +11,7 @@ struct syscall_event {
     __u16 remote_port;
     __u16 family;
     __u64 timestamp_ns;
+    __u64 start_time;
     __u8  comm[16];
     __u8  exec_path[256];
     __u8  args[512];

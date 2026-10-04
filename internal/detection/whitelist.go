@@ -6,7 +6,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/yoursec/rsbp/internal/correlation"
+	"github.com/pavanthakor/RSBP/internal/correlation"
 )
 
 var defaultProcessWhitelist = []string{
@@ -148,6 +148,7 @@ var neverSuppressProcessNames = map[string]struct{}{
 	"nc":      {},
 	"netcat":  {},
 	"ncat":    {},
+	"socat":   {},
 	"dash":    {},
 }
 

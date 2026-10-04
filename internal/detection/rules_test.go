@@ -7,15 +7,15 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/yoursec/rsbp/internal/correlation"
-	"github.com/yoursec/rsbp/internal/enrichment"
-	"github.com/yoursec/rsbp/internal/types"
+	"github.com/pavanthakor/RSBP/internal/correlation"
+	"github.com/pavanthakor/RSBP/internal/enrichment"
+	"github.com/pavanthakor/RSBP/internal/types"
 )
 
 func TestDefaultRulesCount(t *testing.T) {
 	rules := DefaultRules()
-	if len(rules) != 8 {
-		t.Fatalf("expected 8 rules, got %d", len(rules))
+	if len(rules) != 7 {
+		t.Fatalf("expected 7 rules, got %d", len(rules))
 	}
 }
 
@@ -46,7 +46,6 @@ func TestEvaluateRulesIncludesNewRules(t *testing.T) {
 		"CorrelatedBehaviorRule",
 		"LowFPCombinedRule",
 		"ThreatIntelRule",
-		"UnusualTimeRule",
 	}
 	for _, id := range mustContain {
 		if !contains(res.FiredRules, id) {
@@ -75,8 +74,11 @@ func TestFalsePositiveVSCode(t *testing.T) {
 		},
 	}
 	alerts := eng.Evaluate(state, fixedEventAt(time.Date(2026, 3, 25, 12, 0, 0, 0, time.UTC)), "test-host")
-	if len(alerts) != 1 {
-		t.Fatalf("expected VS Code telemetry case to NOT be suppressed due to test modifications, got %d alerts", len(alerts))
+	// Strict behavioural gate: a VS Code telemetry connection (node->sh, 443,
+	// no socket->stdio dup2, no /dev/tcp) exhibits no reverse-shell behaviour and
+	// must be suppressed. (Previously this asserted an alert — a known false positive.)
+	if len(alerts) != 0 {
+		t.Fatalf("expected VS Code telemetry to be suppressed (no RS behaviour), got %d alerts", len(alerts))
 	}
 }
 
@@ -100,8 +102,11 @@ func TestFalsePositiveDocker(t *testing.T) {
 		},
 	}
 	alerts := eng.Evaluate(state, fixedEventAt(time.Date(2026, 3, 25, 12, 0, 0, 0, time.UTC)), "test-host")
-	if len(alerts) != 1 {
-		t.Fatalf("expected docker healthcheck case to NOT be suppressed, got %d alerts", len(alerts))
+	// Strict behavioural gate: a Docker healthcheck (dockerd->sh, 8080, no dup2,
+	// no /dev/tcp) exhibits no reverse-shell behaviour and must be suppressed.
+	// (Previously this asserted an alert — a known false positive.)
+	if len(alerts) != 0 {
+		t.Fatalf("expected docker healthcheck to be suppressed (no RS behaviour), got %d alerts", len(alerts))
 	}
 }
 
@@ -136,15 +141,21 @@ func TestTruePositiveBash(t *testing.T) {
 func TestTruePositivePython(t *testing.T) {
 	eng := NewEngine(Config{ExecConnectWindowSeconds: 10, MinScore: 0.5}, zap.NewNop())
 	state := &correlation.SessionState{
-		PID:        5001,
-		PPID:       1,
-		ExePath:    "/usr/bin/python3",
-		Cmdline:    "python3 socket_client.py --target 203.0.113.9 --port 9001 --socket",
-		HasExecve:  true,
-		HasSocket:  true,
-		HasConnect: true,
-		RemoteIP:   net.ParseIP("203.0.113.9"),
-		RemotePort: 9001,
+		PID:  5001,
+		PPID: 1,
+		// A real python reverse shell duplicates the socket onto stdio before
+		// exec'ing a shell; that dup2-to-stdio is the behavioural core we detect
+		// (and is exactly what the live lab python payload does). A python client
+		// that merely connects, with no dup2, is intentionally NOT alerted under
+		// the strict behavioural gate.
+		ExePath:       "/usr/bin/python3",
+		Cmdline:       "python3 -c import socket,os,pty;...;os.dup2(s.fileno(),0);pty.spawn('/bin/sh')",
+		HasExecve:     true,
+		HasSocket:     true,
+		HasConnect:    true,
+		HasDupToStdio: true,
+		RemoteIP:      net.ParseIP("203.0.113.9"),
+		RemotePort:    9001,
 		StartTime:  time.Now().Add(-1 * time.Second),
 		LastUpdate: time.Now(),
 		ProcessTree: []correlation.ProcessNode{

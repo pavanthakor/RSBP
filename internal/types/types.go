@@ -16,6 +16,7 @@ type SyscallEvent struct {
 	RemotePort     uint16
 	Family         uint16
 	TimestampNS    uint64
+	StartTimeNS    uint64 // process start time (kernel boottime ns); distinguishes a PID across reuse
 	Comm           [16]byte
 	ExecPath       [256]byte
 	Args           [512]byte

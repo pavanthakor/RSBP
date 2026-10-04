@@ -37,6 +37,7 @@ type SessionState struct {
 	Category        int           `json:"category"`
 	ProcessTree     []ProcessNode `json:"process_tree"`
 	FirstEventAt    time.Time     `json:"first_event_at"`
+	StartTimeNS     uint64        `json:"start_time_ns"`
 }
 
 var ShellBinaries = map[string]struct{}{
@@ -122,6 +123,7 @@ var reverseShellProcessExceptionSet = map[string]struct{}{
 	"nc":      {},
 	"netcat":  {},
 	"ncat":    {},
+	"socat":   {},
 	"dash":    {},
 }
 
@@ -227,7 +229,7 @@ func (s *SessionState) IsComplete() bool {
 
 	isRSToolName := func(n string) bool {
 		switch strings.ToLower(strings.TrimSpace(n)) {
-		case "bash", "sh", "python3", "python", "nc", "netcat", "ncat", "dash":
+		case "bash", "sh", "python3", "python", "nc", "netcat", "ncat", "socat", "dash":
 			return true
 		default:
 			return false
