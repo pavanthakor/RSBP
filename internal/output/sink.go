@@ -11,9 +11,9 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 
-	alertpkg "github.com/yoursec/rsbp/internal/alert"
-	plog "github.com/yoursec/rsbp/internal/logging"
-	"github.com/yoursec/rsbp/internal/types"
+	alertpkg "github.com/pavanthakor/RSBP/internal/alert"
+	plog "github.com/pavanthakor/RSBP/internal/logging"
+	"github.com/pavanthakor/RSBP/internal/types"
 )
 
 type Sink interface {
@@ -437,8 +437,8 @@ func convertLegacyAlert(a *types.ReverseShellAlert) *alertpkg.ReverseShellAlert 
 		Timestamp:  a.Timestamp,
 		Severity:   a.Severity,
 		Score:      a.Confidence,
-		Pattern:    a.RuleID,
-		FiredRules: []string{a.RuleID},
+		Pattern:    metadataValue(a.Metadata, "pattern", a.RuleID),
+		FiredRules: firedRulesFromMetadata(a.Metadata, a.RuleID),
 		Process: alertpkg.ProcessDetails{
 			PID:       a.Process.PID,
 			PPID:      a.Process.PPID,
@@ -471,6 +471,27 @@ func convertLegacyAlert(a *types.ReverseShellAlert) *alertpkg.ReverseShellAlert 
 		PipelineStart: a.PipelineStart,
 	}
 	return out
+}
+
+func firedRulesFromMetadata(meta map[string]string, fallback string) []string {
+	if meta != nil {
+		if v, ok := meta["fired_rules"]; ok && strings.TrimSpace(v) != "" {
+			parts := strings.Split(v, ",")
+			out := make([]string, 0, len(parts))
+			for _, p := range parts {
+				if p = strings.TrimSpace(p); p != "" {
+					out = append(out, p)
+				}
+			}
+			if len(out) > 0 {
+				return out
+			}
+		}
+	}
+	if fallback != "" {
+		return []string{fallback}
+	}
+	return nil
 }
 
 func metadataValue(meta map[string]string, key string, fallback string) string {

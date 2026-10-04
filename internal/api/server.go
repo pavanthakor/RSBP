@@ -3,6 +3,7 @@ package api
 import (
 	"bufio"
 	"context"
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -14,9 +15,12 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
-	alertpkg "github.com/yoursec/rsbp/internal/alert"
+	alertpkg "github.com/pavanthakor/RSBP/internal/alert"
 	"go.uber.org/zap"
 )
+
+//go:embed dashboard.html
+var dashboardHTML []byte
 
 type Config struct {
 	Enabled       bool
@@ -87,6 +91,7 @@ func (s *Server) Handler() http.Handler {
 	r.Use(s.loggingMiddleware)
 	r.Use(s.authMiddleware)
 
+	r.Get("/", s.handleDashboard)
 	r.Get("/health", s.handleHealth)
 	r.Get("/health/deep", s.handleHealthDeep)
 	r.Get("/stats", s.handleStats)
@@ -155,6 +160,12 @@ func (s *Server) handleHealthDeep(w http.ResponseWriter, _ *http.Request) {
 	s.writeJSON(w, http.StatusOK, deep)
 }
 
+func (s *Server) handleDashboard(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(dashboardHTML)
+}
+
 func (s *Server) handleStats(w http.ResponseWriter, _ *http.Request) {
 	stats := map[string]any{
 		"uptime":           time.Since(s.start).String(),
@@ -189,6 +200,9 @@ func (s *Server) handleAlerts(w http.ResponseWriter, r *http.Request) {
 		if n, err := strconv.Atoi(q); err == nil && n > 0 {
 			limit = n
 		}
+	}
+	if limit > 1000 { // cap to avoid a huge make() allocation from an untrusted query param
+		limit = 1000
 	}
 	alerts, err := readLastAlerts(s.cfg.AlertsPath, limit)
 	if err != nil {

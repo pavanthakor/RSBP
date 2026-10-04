@@ -11,7 +11,7 @@ import (
 
 	"github.com/segmentio/kafka-go"
 	"github.com/segmentio/kafka-go/sasl/plain"
-	alertpkg "github.com/yoursec/rsbp/internal/alert"
+	alertpkg "github.com/pavanthakor/RSBP/internal/alert"
 	"go.uber.org/zap"
 )
 

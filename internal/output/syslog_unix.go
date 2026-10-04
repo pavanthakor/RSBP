@@ -12,8 +12,8 @@ import (
 	"strings"
 	"time"
 
-	alertpkg "github.com/yoursec/rsbp/internal/alert"
-	"github.com/yoursec/rsbp/internal/types"
+	alertpkg "github.com/pavanthakor/RSBP/internal/alert"
+	"github.com/pavanthakor/RSBP/internal/types"
 	"go.uber.org/zap"
 )
 

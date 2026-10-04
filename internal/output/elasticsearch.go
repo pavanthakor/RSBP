@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"github.com/elastic/go-elasticsearch/v8"
-	alertpkg "github.com/yoursec/rsbp/internal/alert"
+	alertpkg "github.com/pavanthakor/RSBP/internal/alert"
 	"go.uber.org/zap"
 )
 

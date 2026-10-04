@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	alertpkg "github.com/yoursec/rsbp/internal/alert"
+	alertpkg "github.com/pavanthakor/RSBP/internal/alert"
 	"go.uber.org/zap"
 )
 
