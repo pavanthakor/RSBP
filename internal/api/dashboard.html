@@ -164,11 +164,19 @@ function chainHTML(chain,sev){
 }
 
 async function tick(){
+  // Online state depends ONLY on /health responding. The daemon is live if it
+  // answers its health check; alert-fetch or render hiccups must never flip the
+  // header to "daemon offline" while events are clearly flowing.
+  let h;
   try{
-    const [h,al]=await Promise.all([
-      fetch("/health").then(r=>r.json()),
-      fetch("/alerts?limit=25").then(r=>r.json())
-    ]);
+    h=await fetch("/health").then(r=>r.json());
+    failCount=0; setLive(true);
+  }catch(_){
+    failCount++; if(failCount>=3) setLive(false);
+    $("f_clock").textContent=new Date().toTimeString().slice(0,8);
+    return;
+  }
+  try{
     const e=h.ebpf||{},p=h.pipeline||{},hi=h.host_info||{};
     $("s_probes").textContent=fmt(e.probes_attached);
     $("s_uptime").textContent=(h.uptime||"—").replace(/\.\d+s$/,"s");
@@ -186,6 +194,7 @@ async function tick(){
     $("p_det").textContent=fmt(det);
     $("p_verdictbox").classList.toggle("clear",det===0);
 
+    const al=await fetch("/alerts?limit=25").then(r=>r.json());
     const list=Array.isArray(al)?al.slice().reverse():[];
     const stream=$("stream");
     $("h_meta").textContent=list.length?("showing "+list.length):"last 25";
@@ -215,8 +224,7 @@ async function tick(){
       if(topId&&topId!==lastTop&&lastTop!==null) stream.firstElementChild.classList.add("flash");
       lastTop=topId;
     }
-    failCount=0; setLive(true);
-  }catch(_){ failCount++; if(failCount>=3) setLive(false); }
+  }catch(_){ /* numbers/alerts render hiccup — daemon is still live, leave online state alone */ }
   $("f_clock").textContent=new Date().toTimeString().slice(0,8);
 }
 function setLive(ok){

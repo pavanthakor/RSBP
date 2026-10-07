@@ -292,6 +292,17 @@ func (e *Engine) maybeEmit(session *SessionState, complete bool) {
 		return
 	}
 
+	// Wait for a confident signal before emitting. A reverse-shell tool often
+	// becomes "complete" at the connect stage (valid remote), but the defining
+	// "tell" — the socket duplicated onto stdio — can arrive a moment later.
+	// Emitting at connect produced an "unknown"-pattern alert, then a second
+	// "DirectDup2Shell" alert at the dup2 stage (two cards for one shell). Emit
+	// only once we have the tell or a named behavioural pattern, so one reverse
+	// shell yields exactly one alert carrying its real pattern.
+	if !session.HasDupToStdio && sessionPatternName(session) == "unknown" {
+		return
+	}
+
 	key := emittedSessionKey(session)
 	if _, alreadyEmitted := e.emittedSessions.LoadOrStore(key, time.Now()); alreadyEmitted {
 		sessionsExpiredTotal.WithLabelValues("dedup").Inc()
@@ -363,14 +374,12 @@ func emittedSessionKey(session *SessionState) string {
 	if session.RemoteIP != nil {
 		remoteIP = session.RemoteIP.String()
 	}
-	pattern := ""
-	if p := BestMatchPattern(session); p != nil {
-		pattern = p.Name
-	}
-	if pattern == "" {
-		pattern = fmt.Sprintf("cat-%d", session.CategoryDetect())
-	}
-	return fmt.Sprintf("%d|%s|%s", session.PID, remoteIP, pattern)
+	// Key on process identity (PID + kernel start-time) and destination only —
+	// deliberately NOT the matched pattern. A single reverse shell refines its
+	// pattern as more syscalls arrive (connect-stage "unknown", then dup2-stage
+	// "DirectDup2Shell"); keying on the pattern let the same episode emit twice.
+	// StartTimeNS keeps a recycled PID from colliding with the original.
+	return fmt.Sprintf("%d|%d|%s", session.PID, session.StartTimeNS, remoteIP)
 }
 
 // StartMaintenance runs the periodic session-cleanup loop on its own goroutine.
